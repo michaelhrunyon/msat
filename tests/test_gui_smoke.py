@@ -296,6 +296,115 @@ def test_password_return_is_noop_when_connected(root, patched_clients):
     assert app.conn_status["text"] == "Connected to dc1"
 
 
+def test_connect_button_blue_while_connecting(root, patched_clients,
+                                              monkeypatch):
+    """Connect turns blue while the LDAP bind runs, then returns to
+    gray with Disconnect blue once connected.
+
+    The blue state must be applied and a redraw forced *before*
+    the blocking bind — a recording client captures both at the
+    moment connect() runs.
+    """
+    app = MSATApp(root)
+    seen = []
+    redraws = []
+    orig_update = root.update_idletasks
+
+    def counting_update():
+        redraws.append(1)
+        return orig_update()
+
+    monkeypatch.setattr(root, "update_idletasks", counting_update)
+
+    class RecordingADClient(FakeADClient):
+        def connect(self):
+            seen.append(str(app.connect_btn.cget("default")))
+            seen.append(len(redraws))
+            return super().connect()
+
+    monkeypatch.setattr("msat.app.ADClient", RecordingADClient)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert seen[0] == "active", "Connect must be blue while connecting"
+    assert seen[1] >= 1, "a redraw must be forced before the blocking bind"
+    assert str(app.connect_btn.cget("default")) == "normal"
+    assert str(app.disconnect_btn.cget("default")) == "active"
+
+
+def test_password_return_turns_connect_blue_while_connecting(
+        root, patched_clients, monkeypatch):
+    """Enter in the password field takes the same blue-while-connecting
+    path as clicking Connect."""
+    app = MSATApp(root)
+    seen = []
+
+    class RecordingADClient(FakeADClient):
+        def connect(self):
+            seen.append(str(app.connect_btn.cget("default")))
+            return super().connect()
+
+    monkeypatch.setattr("msat.app.ADClient", RecordingADClient)
+    app.server_var.set("dc1")
+    app.domain_var.set("example.local")
+    app.username_var.set("michael")
+    app.password_var.set("secret")
+    assert app._on_password_return(None) == "break"
+    root.update_idletasks()
+    assert seen == ["active"]
+    assert str(app.connect_btn.cget("default")) == "normal"
+    assert str(app.disconnect_btn.cget("default")) == "active"
+
+
+def test_connect_button_gray_on_failed_connect(root, patched_clients,
+                                               monkeypatch):
+    """A failed connect returns Connect to gray and leaves
+    Disconnect gray (not connected)."""
+    from msat.ldap_client import ADInvalidCredentialsError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+
+    class BadCredsADClient(FakeADClient):
+        def connect(self):
+            raise ADInvalidCredentialsError(
+                "Invalid credentials — the username or password is "
+                "incorrect for dc1.")
+
+    monkeypatch.setattr("msat.app.ADClient", BadCredsADClient)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert shown, "expected the invalid-credentials dialog"
+    assert app.ad_client is None
+    assert str(app.connect_btn.cget("default")) == "normal"
+    assert str(app.disconnect_btn.cget("default")) == "normal"
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+
+
+def test_disconnect_returns_buttons_to_gray(root, patched_clients):
+    """Disconnecting returns both buttons to their default gray."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert str(app.disconnect_btn.cget("default")) == "active"
+    app._global_disconnect()
+    root.update_idletasks()
+    assert str(app.connect_btn.cget("default")) == "normal"
+    assert str(app.disconnect_btn.cget("default")) == "normal"
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+
+
+def test_root_return_guard_installed(root, patched_clients):
+    """A Return guard is installed on the toplevel so a stray
+    Return in a search box or treeview cannot invoke the default
+    (blue) button, and it returns "break"."""
+    app = MSATApp(root)
+    assert app.root.bind("<Return>"), "expected a Return guard on the root"
+    assert app._on_root_return(None) == "break"
+
+
 def test_dhcp_uses_global_server_when_it_has_dhcp(root, patched_clients):
     app = MSATApp(root)
     _connect_app(app, "dc2")

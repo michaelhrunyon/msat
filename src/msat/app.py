@@ -215,6 +215,26 @@ class MSATApp:
         self.conn_status = ttk.Label(bar, text="Not connected")
         self.conn_status.pack(side=tk.LEFT, padx=8)
 
+        # Return guard for the button accent (below): a button in
+        # the "default" state is the toplevel's default button, so
+        # a Return keypress in a widget that does not handle Return
+        # itself (a search box, a treeview) would invoke it — with
+        # Disconnect blue while connected, a stray Return in a
+        # search field would disconnect the app. Swallow Return at
+        # the toplevel. The password entry handles Return itself
+        # (its widget binding fires first and returns "break"), so
+        # Enter-to-Connect is unaffected, and a focused button
+        # still answers Return through its own binding.
+        self.root.bind("<Return>", self._on_root_return)
+
+    def _on_root_return(self, _event):
+        """Swallow Return at the toplevel (see _build_global_bar).
+
+        Returns "break" so a Return in a widget with no Return
+        binding of its own never reaches the default button.
+        """
+        return "break"
+
     def _open_settings(self):
         """Edit the connection defaults (domain, servers).
 
@@ -266,6 +286,14 @@ class MSATApp:
                                    "Server, username and password are required.",
                                    parent=self.root)
             return
+        # The connection is underway: turn Connect blue while the
+        # blocking LDAP bind/validation runs. The connect is
+        # synchronous, so force a redraw first — without it the
+        # blue state would never be painted before the bind blocks.
+        # The "default" option is the macOS way to draw a ttk
+        # button blue (Aqua ignores a plain background colour).
+        self.connect_btn.config(default="active")
+        self.root.update_idletasks()
         self.creds.set(server, domain, username, password, DEFAULT_LDAPS_PORT)
         # The LDAP bind is the credential check, and a search right
         # after it proves the credentials are actually usable: a
@@ -418,6 +446,13 @@ class MSATApp:
         """Enable/disable the global bar and every tab's toolbar."""
         self.connect_btn.config(state=tk.DISABLED if connected else tk.NORMAL)
         self.disconnect_btn.config(state=tk.NORMAL if connected else tk.DISABLED)
+        # Accent (blue) state. While connected the Disconnect
+        # button is blue and Connect is back to gray; while
+        # disconnected neither is. This also clears the transient
+        # "connecting" blue on Connect, on success and on failure
+        # (via _fail_connect) alike.
+        self.connect_btn.config(default="normal")
+        self.disconnect_btn.config(default="active" if connected else "normal")
         self.conn_status.config(
             text="Connected to {}".format(self.server_var.get().strip())
             if connected else "Not connected")

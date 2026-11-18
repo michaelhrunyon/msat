@@ -29,6 +29,11 @@ and the connection status label and status bar both read
 "Connection failed: invalid credentials". Correct the credentials
 and click **Connect** again.
 
+The buttons show the connection state: **Connect** turns blue
+while a connection is underway, and once connected it returns to
+gray and **Disconnect** is blue instead. If the connection fails,
+both return to gray.
+
 **Role detection.** Once the credentials check out, the app
 examines the installed roles on the connected server (over WinRM)
 and enables each tab only where its role is present: AD and

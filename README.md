@@ -26,7 +26,11 @@ the Group Policy Management Console on a domain controller.
   username, password (masked), Connect / Disconnect, and a status
   label. AD, DHCP and DNS all run on the same domain controllers, so
   you connect once. Pressing Enter while the password field has
-  focus connects, the same as clicking Connect.
+  focus connects, the same as clicking Connect. Connect turns blue
+  while a connection is underway; once connected it returns to
+  gray and Disconnect is blue instead, so the blue button always
+  shows the current state. If the connection fails, both return
+  to gray.
 - **Credential validation up front.** Connect gates on the LDAP bind
   and a small validation search before anything is marked connected.
   If the username or password is wrong, the app stays disconnected
@@ -277,7 +281,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.3** — tested against a live Active Directory environment (3 DCs). 185 tests passing.
+**v1.8.4** — tested against a live Active Directory environment (3 DCs). 190 tests passing.
 
 ## Known limitations
 
