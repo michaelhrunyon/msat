@@ -20,8 +20,9 @@ background-thread search returns operationsError from the DC).
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import dialogs
-from .constants import (APP_TITLE, DEFAULT_LDAPS_PORT, DEFAULT_WINRM_PORT)
+from . import dialogs, updater
+from .constants import (APP_TITLE, APP_VERSION, DEFAULT_LDAPS_PORT,
+                        DEFAULT_WINRM_PORT)
 from .credentials import CredentialStore
 from .dhcp import DHCPManager
 from .dns import DNSManager
@@ -109,7 +110,63 @@ class MSATApp:
 
         self.statusbar = ttk.Label(root, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
         self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_menu()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Deferred update check: the main window appears first, then
+        # the check runs synchronously (5-second timeout). It is
+        # silent unless a newer release is actually found — see
+        # _check_for_updates.
+        self.root.after(2000, self._startup_update_check)
+
+    # -- menu bar / updates --------------------------------------------------
+
+    def _build_menu(self):
+        """Menu bar: a Help menu with the manual update check."""
+        self._menubar = tk.Menu(self.root, tearoff=0)
+        self._help_menu = tk.Menu(self._menubar, tearoff=0)
+        self._help_menu.add_command(label="Check for Updates…",
+                                    command=self._manual_update_check)
+        self._menubar.add_cascade(label="Help", menu=self._help_menu)
+        self.root.config(menu=self._menubar)
+
+    def _startup_update_check(self):
+        """Automatic check shortly after launch (silent unless an
+        update is found)."""
+        self._check_for_updates(manual=False)
+
+    def _manual_update_check(self):
+        """Help → Check for Updates… — always says what it found."""
+        self._check_for_updates(manual=True)
+
+    def _check_for_updates(self, manual=False):
+        """Check GitHub Releases for a newer MSAT version.
+
+        Automatic (startup) checks are completely silent unless a
+        newer release is found: up-to-date, unreachable or malformed
+        responses produce no dialog and no status-bar noise. A manual
+        check reports what it found instead. No background threads are
+        used — the check is one short synchronous request on the UI
+        thread.
+        """
+        release = updater.get_latest_release()
+        if release is None:
+            if manual:
+                messagebox.showinfo(
+                    "Check for Updates",
+                    "Could not reach GitHub to check for updates.\n"
+                    "Check your connection and try again.",
+                    parent=self.root)
+            return
+        if not updater.is_newer(release["tag"], APP_VERSION):
+            if manual:
+                messagebox.showinfo(
+                    "Check for Updates",
+                    "You have the latest version (v{}).".format(APP_VERSION),
+                    parent=self.root)
+            return
+        dlg = dialogs.UpdateDialog(self.root, release, APP_VERSION)
+        self.root.wait_window(dlg)
 
     # -- global connection ---------------------------------------------------
 

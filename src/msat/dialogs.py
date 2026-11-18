@@ -8,8 +8,10 @@ the caller with a message box.
 """
 
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
 
+from . import updater
 from .constants import DEFAULT_DOMAIN, DEFAULT_LDAPS_PORT, DEFAULT_WINRM_PORT
 from .dhcp import normalize_mac, validate_ipv4
 from .dns import validate_ipv6
@@ -1445,3 +1447,102 @@ class SettingsDialog(DialogBase):
             "default_server": self._resolved_default(),
         }
 
+
+
+# --------------------------------------------------------------------------
+# Update
+# --------------------------------------------------------------------------
+
+# Brief install steps shown after a release zip is downloaded. MSAT
+# never installs itself: a running .app cannot replace itself, and
+# overwriting a running program's source files is fragile.
+_INSTALL_STEPS = (
+    "To install it:\n"
+    "• From source — unzip the file over the project folder, re-run\n"
+    "  ./setup.sh if needed, then relaunch.\n"
+    "• MSAT.app — unzip and replace MSAT.app in /Applications.\n"
+    "Your settings are not touched — they live in ~/.msat/settings.json,\n"
+    "outside the app folder."
+)
+
+
+class UpdateDialog(tk.Toplevel):
+    """A newer MSAT release is available (modal).
+
+    Shows the new version against the running version, the release
+    notes from GitHub (read-only, scrollable), and three actions:
+    Download (fetch the release zip into ~/Downloads, then show the
+    saved path and the install steps), View on GitHub (open the
+    release page in the default browser), Later (dismiss).
+    """
+
+    def __init__(self, parent, release, current_version):
+        super().__init__(parent)
+        self.title("MSAT update available")
+        self.transient(parent)
+        self.release = release
+        self.current_version = current_version
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self.title_label = ttk.Label(
+            body,
+            text="MSAT {} is available — you have v{}.".format(
+                release["tag"], current_version),
+            font=("", 11, "bold"), wraplength=460, justify=tk.LEFT)
+        self.title_label.pack(fill=tk.X, pady=(0, 8))
+
+        notes_frame = ttk.Frame(body)
+        notes_frame.pack(fill=tk.BOTH, expand=True)
+        self.notes_text = tk.Text(notes_frame, wrap=tk.WORD, width=62,
+                                  height=14)
+        scrollbar = ttk.Scrollbar(notes_frame, orient=tk.VERTICAL,
+                                  command=self.notes_text.yview)
+        self.notes_text.configure(yscrollcommand=scrollbar.set)
+        self.notes_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.notes_text.insert("1.0", release.get("body") or
+                               "(No release notes.)")
+        self.notes_text.config(state=tk.DISABLED)
+
+        self.status_label = ttk.Label(body, text="", wraplength=460,
+                                      justify=tk.LEFT)
+        self.status_label.pack(fill=tk.X, pady=(8, 0))
+
+        buttons = ttk.Frame(self, padding=(12, 0, 12, 12))
+        buttons.pack(fill=tk.X)
+        self.download_btn = ttk.Button(buttons, text="Download",
+                                       command=self._on_download)
+        self.download_btn.pack(side=tk.LEFT)
+        ttk.Button(buttons, text="View on GitHub",
+                   command=self._on_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Later",
+                   command=self.destroy).pack(side=tk.RIGHT)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        _center(self, self.master)
+
+    def _on_download(self):
+        """Fetch the release zip into ~/Downloads, then report where
+        it landed and how to install it."""
+        self.download_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="Downloading…")
+        self.update_idletasks()
+        path = updater.download_release_zip(self.release.get("zip_url"))
+        if path is None:
+            if not self.release.get("zip_url"):
+                self.status_label.config(
+                    text="This release has no downloadable zip — "
+                         "use View on GitHub to get it.")
+            else:
+                self.status_label.config(
+                    text="Download failed — check your connection and "
+                         "try again, or use View on GitHub.")
+            self.download_btn.config(state=tk.NORMAL)
+            return
+        self.status_label.config(
+            text="Downloaded to:\n{}\n\n{}".format(path, _INSTALL_STEPS))
+
+    def _on_view(self):
+        webbrowser.open(self.release.get("html_url") or "")

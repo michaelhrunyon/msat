@@ -96,6 +96,33 @@ to those placeholders. A settings file saved by v1.7.0 (at the old
 the new location has no file, and the next save writes to the new
 location.
 
+## Updating MSAT
+
+Shortly after launch the app checks GitHub Releases for a newer
+published version. The check is silent when you are up to date or
+when GitHub cannot be reached — no dialog, no status-bar message.
+Help → **Check for Updates…** runs the same check on demand and
+always says what it found ("You have the latest version" when you
+are current, or that GitHub could not be reached).
+
+When a newer release exists, a dialog shows the new version against
+the one you are running and the release notes from GitHub, with
+three choices:
+
+- **Download** — downloads the release zip into `~/Downloads`
+  (`msat-vX.Y.Z.zip`) and shows the saved path and the install
+  steps in the dialog.
+- **View on GitHub** — opens the release page in your browser.
+- **Later** — dismisses the dialog; nothing is downloaded.
+
+MSAT never updates itself in place: a running .app cannot replace
+itself, and overwriting a running program's source files is fragile.
+To install a downloaded release, unzip it over the project folder
+(from source: re-run `./setup.sh` if needed, then relaunch) or
+replace MSAT.app in `/Applications`. Your settings are never
+touched — they live in `~/.msat/settings.json`, outside the app
+folder and outside the app bundle.
+
 ## AD Users & Computers
 
 - **Browse:** the left pane is the OU tree. Click an OU to list its

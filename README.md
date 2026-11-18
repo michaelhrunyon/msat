@@ -89,6 +89,16 @@ the Group Policy Management Console on a domain controller.
   clearing it shows everything again. Each search box has a small
   **×** button beside it that clears the search text and restores
   the full list.
+- **Update check:** shortly after launch the app quietly checks
+  GitHub Releases for a newer published version. Help → Check for
+  Updates… runs the same check on demand. Nothing happens when you
+  are up to date or the check cannot reach GitHub. When a newer
+  release exists, a dialog shows the new version against yours and
+  the release notes, and offers to download the release zip into
+  ~/Downloads — you install it yourself (unzip over the project
+  folder, or replace MSAT.app in /Applications). The app never
+  replaces itself in place, and your settings
+  (`~/.msat/settings.json`) are never touched.
 - **Tab load failures are non-modal:** if a tab fails to load while
   connecting, the failure is reported in the status bar instead of a
   dialog, and the other tabs keep working. Retry from the tab's own
@@ -267,7 +277,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.2** — tested against a live Active Directory environment (3 DCs). 143 tests passing.
+**v1.8.3** — tested against a live Active Directory environment (3 DCs). 185 tests passing.
 
 ## Known limitations
 
