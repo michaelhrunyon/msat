@@ -9,7 +9,7 @@ import pytest
 from ldap3 import ALL, Connection, MOCK_SYNC, Server
 
 from msat.ldap_client import (
-    ADClient, ADConnectionError, encode_password,
+    ADClient, ADConnectionError, encode_password, is_locked_out,
 )
 
 DOMAIN_DN = "DC=example,DC=local"
@@ -201,6 +201,25 @@ def test_list_children_of_ou(client):
     assert by_name["John Doe"]["status"] == "Enabled"
     assert by_name["Locked User"]["status"] == "Enabled, Locked"
     assert by_name["Disabled User"]["status"] == "Disabled"
+    # The parsed lockout flag feeds the list's "Locked" column.
+    assert by_name["Locked User"]["locked"] is True
+    assert by_name["John Doe"]["locked"] is False
+    assert by_name["Disabled User"]["locked"] is False
+
+
+def test_is_locked_out_helper():
+    """lockoutTime non-zero means locked; '0' or missing means not."""
+    locked = {"lockoutTime": {"values": ["133000000000000000"],
+                              "binary": False}}
+    assert is_locked_out(locked) is True
+    unlocked = {"lockoutTime": {"values": ["0"], "binary": False}}
+    assert is_locked_out(unlocked) is False
+    assert is_locked_out({}) is False
+    empty = {"lockoutTime": {"values": [], "binary": False}}
+    assert is_locked_out(empty) is False
+    # An integer value (as ldap3 may return it) works too.
+    assert is_locked_out({"lockoutTime": {"values": [133000000000000000],
+                                          "binary": False}}) is True
 
 
 def test_computer_is_not_listed_as_user(client):

@@ -25,7 +25,8 @@ the Group Policy Management Console on a domain controller.
 - **One global connection bar** for the whole app: server, domain,
   username, password (masked), Connect / Disconnect, and a status
   label. AD, DHCP and DNS all run on the same domain controllers, so
-  you connect once.
+  you connect once. Pressing Enter while the password field has
+  focus connects, the same as clicking Connect.
 - **Credential validation up front.** Connect gates on the LDAP bind
   and a small validation search before anything is marked connected.
   If the username or password is wrong, the app stays disconnected
@@ -52,15 +53,22 @@ the Group Policy Management Console on a domain controller.
 - **AD tree browsing:** the left pane is the OU tree; clicking an OU
   lists its contents on the right. Expanding a node loads its
   children on the first try, at any depth. Double-click an OU in the
-  right-hand list to drill into it.
+  right-hand list to drill into it. The list has a **Locked** column
+  that shows "Yes" for a user account that is currently locked out
+  (AD's `lockoutTime` is non-zero; AD clears it to 0 when the
+  lockout expires) and is blank otherwise, so locked accounts are
+  identifiable at a glance; the Status column also reads
+  "Enabled, Locked" / "Disabled, Locked" for those accounts.
 - **User and Group Properties:** double-click a user or group (or
   select one and click **Properties**). A General tab edits the common
-  fields; an Attribute Editor lists every attribute (binary attributes
-  such as `objectGUID` / `objectSid` shown as hex, read-only), with a
-  search box that filters by attribute name or value. Only changed
-  attributes are written back. Groups also get a **Members** tab
-  (Add / Remove, applied immediately); the `member` attribute is
-  read-only in the Attribute Editor.
+  fields; for a user it also shows a read-only "Locked out" row
+  (Yes/No) for the account's current lockout state, which is never
+  written back. An Attribute Editor lists every attribute (binary
+  attributes such as `objectGUID` / `objectSid` shown as hex,
+  read-only), with a search box that filters by attribute name or
+  value. Only changed attributes are written back. Groups also get a
+  **Members** tab (Add / Remove, applied immediately); the `member`
+  attribute is read-only in the Attribute Editor.
 - **AD actions:** New User / Computer / Group, Enable / Disable,
   Unlock, Reset Password, Add to Group, Delete (with confirmation).
 - **DHCP:** scopes with leases and reservations, superscopes.
@@ -78,7 +86,9 @@ the Group Policy Management Console on a domain controller.
 - **Search:** the AD, DHCP and DNS tabs each have a Search box above
   their lists, and the Properties Attribute Editor has one too. It
   filters the rows already loaded, as you type (case-insensitive);
-  clearing it shows everything again.
+  clearing it shows everything again. Each search box has a small
+  **×** button beside it that clears the search text and restores
+  the full list.
 - **Tab load failures are non-modal:** if a tab fails to load while
   connecting, the failure is reported in the status bar instead of a
   dialog, and the other tabs keep working. Retry from the tab's own
@@ -257,7 +267,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.1** — tested against a live Active Directory environment (3 DCs). 135 tests passing.
+**v1.8.2** — tested against a live Active Directory environment (3 DCs). 143 tests passing.
 
 ## Known limitations
 

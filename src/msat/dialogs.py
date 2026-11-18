@@ -13,7 +13,7 @@ from tkinter import messagebox, ttk
 from .constants import DEFAULT_DOMAIN, DEFAULT_LDAPS_PORT, DEFAULT_WINRM_PORT
 from .dhcp import normalize_mac, validate_ipv4
 from .dns import validate_ipv6
-from .ldap_client import GROUP_TYPES
+from .ldap_client import GROUP_TYPES, is_locked_out
 
 
 def _center(window, parent):
@@ -372,9 +372,12 @@ def _fill_attr_tree(tree, values, binary, needle="", readonly=()):
 def _make_attr_search_row(parent, on_change):
     """A 'Search:' label + entry on its own row above an attribute list.
 
-    Returns the StringVar holding the search text. Typing filters the
-    list below it (client-side only); clearing the box shows every
-    attribute again.
+    Returns (StringVar holding the search text, clear button).
+    Typing filters the list below it (client-side only); clearing
+    the box shows every attribute again. The clear (×) button
+    empties the search text and re-runs the filter, restoring the
+    full list. It is always visible — simpler and more reliable in
+    Tkinter than showing it only when text is present.
     """
     frame = ttk.Frame(parent)
     frame.pack(fill=tk.X, pady=(0, 4))
@@ -383,7 +386,14 @@ def _make_attr_search_row(parent, on_change):
     entry = ttk.Entry(frame, textvariable=var, width=32)
     entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
     entry.bind("<KeyRelease>", lambda _e: on_change())
-    return var
+
+    def _clear():
+        var.set("")
+        on_change()
+
+    clear_btn = ttk.Button(frame, text="×", width=2, command=_clear)
+    clear_btn.pack(side=tk.LEFT, padx=(0, 4))
+    return var, clear_btn
 
 
 def _edit_attribute_value(parent, attr, values):
@@ -514,6 +524,21 @@ class UserPropertiesDialog(tk.Toplevel):
                 entry.config(state=tk.DISABLED)
             self._general_entries[attr] = entry
 
+        # Lockout state is read-only display, not an editable field:
+        # lockoutTime is a system attribute AD manages itself (a
+        # non-zero value means currently locked out; AD clears it to 0
+        # when the lockout expires). It is deliberately NOT in
+        # _general_entries, so Save never writes it back.
+        lock_frame = ttk.Frame(general)
+        lock_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(lock_frame, text="Locked out", width=24,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        self._lockout_entry = ttk.Entry(lock_frame, width=42)
+        self._lockout_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._lockout_entry.insert(
+            0, "Yes" if is_locked_out(attributes) else "No")
+        self._lockout_entry.config(state=tk.DISABLED)
+
         editor = ttk.Frame(notebook, padding=8)
         notebook.add(editor, text="Attribute Editor")
         ttk.Label(editor,
@@ -522,7 +547,7 @@ class UserPropertiesDialog(tk.Toplevel):
                   font=("TkDefaultFont", 9, "italic")).pack(anchor=tk.W, pady=(0, 4))
         # Search sits on its own row above the attribute list; typing
         # filters the displayed attributes by name or value.
-        self._attr_search_var = _make_attr_search_row(
+        self._attr_search_var, self._attr_clear_btn = _make_attr_search_row(
             editor, self._fill_attr_tree)
         cols = ("Attribute", "Value")
         self._attr_tree = ttk.Treeview(editor, columns=cols, show="headings",
@@ -896,7 +921,7 @@ class GroupPropertiesDialog(tk.Toplevel):
                        "binary attributes are read-only. Membership is managed "
                        "on the Members tab.",
                   font=("TkDefaultFont", 9, "italic")).pack(anchor=tk.W, pady=(0, 4))
-        self._attr_search_var = _make_attr_search_row(
+        self._attr_search_var, self._attr_clear_btn = _make_attr_search_row(
             editor, self._fill_attr_tree)
         cols = ("Attribute", "Value")
         self._attr_tree = ttk.Treeview(editor, columns=cols, show="headings",

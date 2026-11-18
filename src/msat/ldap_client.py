@@ -156,6 +156,22 @@ def object_type_from_classes(object_classes):
     return "object"
 
 
+def is_locked_out(attributes):
+    """True when a get_object_attributes() dict shows a lockout.
+
+    ``attributes`` maps attr -> {"values": [str, ...], "binary": bool}
+    (the shape get_object_attributes() returns). lockoutTime is a
+    Windows FILETIME: non-zero means the account is currently locked
+    out (AD clears it to 0 when the lockout expires); a missing
+    attribute or "0" means not locked.
+    """
+    info = attributes.get("lockoutTime") or {}
+    values = info.get("values") or []
+    if not values:
+        return False
+    return _to_int(values[0]) != 0
+
+
 class ADClient:
     """An LDAPS connection to one domain controller.
 
@@ -385,6 +401,10 @@ class ADClient:
             "display_name": _first(attrs, "displayName", ""),
             "uac": uac,
             "status": status,
+            # True only for a user whose lockoutTime is non-zero
+            # (AD clears it to 0 when the lockout expires). The list
+            # shows this in its own "Locked" column.
+            "locked": obj_type == "user" and lockout != 0,
             "group_type": _to_int(_first(attrs, "groupType", 0)),
             "attributes": attrs,
         }
@@ -571,7 +591,8 @@ class ADClient:
                 label = _rdn_value(dn)
                 info = {"dn": dn, "type": "", "name": label, "sam": "",
                         "description": "", "display_name": label, "uac": 0,
-                        "status": "", "group_type": 0, "attributes": {}}
+                        "status": "", "locked": False, "group_type": 0,
+                        "attributes": {}}
             out.append(info)
         return out
 

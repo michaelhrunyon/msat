@@ -82,8 +82,11 @@ class MSATApp:
         # Client-side search boxes (AD / DHCP / DNS). The Entry widgets
         # are disabled when disconnected; their StringVars are cleared
         # on disconnect so a stale filter cannot hide freshly loaded rows.
+        # Each search row also has a small clear (×) button, tracked
+        # here so it is enabled/disabled with its entry.
         self._search_entries = []
         self._search_vars = []
+        self._search_clear_btns = []
 
         self._build_global_bar()
 
@@ -139,6 +142,8 @@ class MSATApp:
         self.password_entry = ttk.Entry(bar, textvariable=self.password_var,
                                         width=18, show="*")
         self.password_entry.pack(side=tk.LEFT, padx=(2, 8))
+        # Enter in the password field acts like clicking Connect.
+        self.password_entry.bind("<Return>", self._on_password_return)
 
         self.connect_btn = ttk.Button(bar, text="Connect",
                                       command=self._global_connect)
@@ -181,6 +186,18 @@ class MSATApp:
         self.server_combo.config(values=self.settings["servers"])
         self.server_var.set(self.settings["default_server"])
         self.domain_var.set(self.settings["domain"])
+
+    def _on_password_return(self, _event):
+        """Enter in the password field acts like clicking Connect.
+
+        No-op when already connected — the entry is disabled then,
+        but guard anyway so Enter can never trigger a disconnect or
+        a reconnect. Returns "break" so the keypress goes no further.
+        """
+        if self.ad_client is not None:
+            return "break"
+        self._global_connect()
+        return "break"
 
     def _global_connect(self):
         server = self.server_var.get().strip()
@@ -356,6 +373,8 @@ class MSATApp:
             btn.config(state=state)
         for entry in self._search_entries:
             entry.config(state=state)
+        for btn in self._search_clear_btns:
+            btn.config(state=state)
         # Role gating overrides the plain connected/disconnected
         # state: a tab whose role is missing stays gated even though
         # the app is connected.
@@ -608,8 +627,19 @@ class MSATApp:
                           state=tk.DISABLED)
         entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         entry.bind("<KeyRelease>", lambda _e: on_change())
+        # A small clear (×) button beside the entry: empties the
+        # search text and re-runs the filter, restoring the full,
+        # unfiltered list. Always visible — simpler and more reliable
+        # in Tkinter than showing it only when text is present.
+        def _clear():
+            var.set("")
+            on_change()
+        clear_btn = ttk.Button(frame, text="×", width=2, command=_clear,
+                               state=tk.DISABLED)
+        clear_btn.pack(side=tk.LEFT, padx=(0, 4))
         self._search_entries.append(entry)
         self._search_vars.append(var)
+        self._search_clear_btns.append(clear_btn)
         return var
 
     @staticmethod
@@ -675,7 +705,7 @@ class MSATApp:
         # container, client-side, as you type.
         self._ad_search_var = self._make_search_row(
             list_frame, self._ad_apply_filter)
-        columns = ("Name", "Type", "Description", "Status")
+        columns = ("Name", "Type", "Description", "Status", "Locked")
         self.ad_list = ttk.Treeview(list_frame, columns=columns,
                                     show="headings")
         for col in columns:
@@ -684,6 +714,7 @@ class MSATApp:
         self.ad_list.column("Type", width=80)
         self.ad_list.column("Description", width=220)
         self.ad_list.column("Status", width=110)
+        self.ad_list.column("Locked", width=60)
         self.ad_list.pack(fill=tk.BOTH, expand=True)
         self.ad_list.bind("<Double-Button-1>", self._ad_on_list_double_click)
         paned.add(list_frame, weight=2)
@@ -836,8 +867,14 @@ class MSATApp:
         """Repopulate the object list from the loaded rows, applying the search text."""
         rows = []
         for child in self._ad_rows:
+            # "Locked" is its own column so a locked-out account is
+            # identifiable at a glance ("Yes"); blank otherwise. Use
+            # .get() — rows built by hand (e.g. in tests) may not
+            # carry the key.
+            locked = "Yes" if child.get("locked") else ""
             rows.append((child["dn"], (child["name"], child["type"].capitalize(),
-                                        child["description"], child["status"])))
+                                        child["description"], child["status"],
+                                        locked)))
         self._refill_filtered(self.ad_list, rows, self._ad_search_var.get())
 
     def _ad_on_list_double_click(self, _event):

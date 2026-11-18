@@ -17,7 +17,9 @@ done in the Group Policy Management Console on a domain controller
   all work.
 - **Password** — masked; held in memory only.
 
-Click **Connect**. Credentials are validated up front: the LDAP
+Click **Connect** — or press Enter while the password field has
+focus, which does the same thing (it is a no-op once connected).
+Credentials are validated up front: the LDAP
 bind is checked and a small search is run before anything is
 marked connected. If the username or password is wrong, the app
 stays disconnected and says so plainly — a dialog titled
@@ -97,19 +99,28 @@ location.
 ## AD Users & Computers
 
 - **Browse:** the left pane is the OU tree. Click an OU to list its
-  contents on the right (Name, Type, Description, Status). OUs load
-  their children when you expand them. Double-click an OU in the
-  right-hand list to navigate into it.
+  contents on the right (Name, Type, Description, Status, Locked).
+  OUs load their children when you expand them. Double-click an OU
+  in the right-hand list to navigate into it. The **Locked** column
+  shows "Yes" for a user account that is currently locked out
+  (AD's `lockoutTime` is non-zero; AD clears it to 0 when the
+  lockout expires) and is blank otherwise, so locked accounts are
+  identifiable at a glance. The Status column also reads
+  "Enabled, Locked" / "Disabled, Locked" for those accounts.
 - **Search:** the Search box above the right-hand list filters the
   rows already loaded for the current container as you type
-  (case-insensitive, matches Name, Type, Description or Status).
-  Clearing it shows everything again. It does not run a new search
-  against the server.
+  (case-insensitive, matches Name, Type, Description, Status or
+  Locked). Clearing it shows everything again. It does not run a
+  new search against the server. The small **×** button beside the
+  box clears the search text and restores the full list.
 - **Properties:** double-click a user or a group (or select one and
   click **Properties**) to open its properties. For a user, the
   **General** tab edits the common attributes (display name,
   first/last name, email, telephone, title, department, company,
-  description, office); sAMAccountName is shown read-only. For a
+  description, office); sAMAccountName is shown read-only. A
+  read-only **Locked out** row on the General tab shows Yes/No for
+  the account's current lockout state — it is never written back,
+  since lockout is managed by AD itself. For a
   group, the **General** tab edits display name, description and
   email (username, group type and DN read-only), and a **Members**
   tab lists the current members with **Add…** and **Remove** —
@@ -118,7 +129,9 @@ location.
   attribute — double-click one to edit its value(s), one value per
   line for multi-valued attributes such as `proxyAddresses`;
   leaving it empty clears the attribute. The Search box above the
-  list filters attributes by name or value as you type. Binary
+  list filters attributes by name or value as you type; the small
+  **×** button beside it clears the search and shows all attributes
+  again. Binary
   attributes (`objectGUID`, `objectSid`, `msExchMailboxGuid`, …)
   are shown as hex and cannot be edited; in a group, `member` is
   also read-only here — use the Members tab. Only attributes you
@@ -148,7 +161,9 @@ location.
   "Role detection" under Connecting).
 - **Search:** the Search box above the scopes list filters scopes,
   leases and reservations as you type (case-insensitive, matches
-  any visible column). Clearing it shows everything again.
+  any visible column). Clearing it shows everything again. The
+  small **×** button beside the box clears the search text and
+  restores the full list.
 - **Select a scope** to see its leases (left) and reservations (right).
 - **Add Reservation:** needs a scope selected. Enter the IP, the MAC
   address (colons, dashes or plain hex all work), a name, and an
@@ -171,7 +186,9 @@ location.
   with a note naming the missing role.
 - **Search:** the Search box above the lists filters zones and
   records as you type (case-insensitive, matches any visible
-  column). Clearing it shows everything again.
+  column). Clearing it shows everything again. The small **×**
+  button beside the box clears the search text and restores the
+  full list.
 - **Select a zone** to see its records (hostname, type, data, TTL).
 - **Add Record:** choose the type — A (IPv4), CNAME (alias), PTR
   (reverse), MX (mail). For the zone apex use `@` as the record name.

@@ -258,6 +258,44 @@ def test_global_connect_validation_search_failure_stays_disconnected(
     assert app.conn_status["text"] == "Connection failed: invalid credentials"
 
 
+def test_password_return_invokes_connect(root, patched_clients):
+    """Enter in the password field acts like clicking Connect."""
+    app = MSATApp(root)
+    # The password entry has its own Return binding (event_generate
+    # does not deliver synthetic key events in this xvfb environment,
+    # so the wiring is checked directly: the binding exists, invoking
+    # its handler connects, and it returns "break").
+    assert any("Return" in pattern for pattern in app.password_entry.bind())
+    app.server_var.set("dc1")
+    app.domain_var.set("example.local")
+    app.username_var.set("michael")
+    app.password_var.set("secret")
+    assert app._on_password_return(None) == "break"
+    root.update_idletasks()
+    assert app.ad_client is not None
+    assert app.creds.is_set
+    assert str(app.connect_btn["state"]) == "disabled"
+    assert str(app.disconnect_btn["state"]) == "normal"
+    assert app.conn_status["text"] == "Connected to dc1"
+
+
+def test_password_return_is_noop_when_connected(root, patched_clients):
+    """Enter in the password field must not disconnect or reconnect
+    when the app is already connected."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+    client = app.ad_client
+    assert app._on_password_return(None) == "break"
+    root.update_idletasks()
+    # Same client, still connected, still showing connected.
+    assert app.ad_client is client
+    assert str(app.connect_btn["state"]) == "disabled"
+    assert str(app.disconnect_btn["state"]) == "normal"
+    assert app.conn_status["text"] == "Connected to dc1"
+
+
 def test_dhcp_uses_global_server_when_it_has_dhcp(root, patched_clients):
     app = MSATApp(root)
     _connect_app(app, "dc2")
@@ -392,6 +430,151 @@ def test_ad_search_filters_rows(root, patched_clients):
     app._ad_search_var.set("")
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 2  # clearing restores all
+
+
+def test_ad_list_shows_locked_column(root, patched_clients):
+    """Locked-out users are identifiable at a glance in their own
+    'Locked' column ('Yes'); other rows are blank there."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert "Locked" in app.ad_list["columns"]
+    app._ad_rows = [
+        {"dn": "CN=locked,DC=example,DC=local", "name": "Locked User",
+         "type": "user", "description": "", "status": "Enabled, Locked",
+         "locked": True},
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled",
+         "locked": False},
+        {"dn": "CN=WS01,DC=example,DC=local", "name": "WS01",
+         "type": "computer", "description": "", "status": "Enabled",
+         "locked": False},
+    ]
+    app._ad_apply_filter()
+    values = {app.ad_list.item(i, "values")[0]: app.ad_list.item(i, "values")
+              for i in app.ad_list.get_children()}
+    assert values["Locked User"][4] == "Yes"
+    assert values["John Doe"][4] == ""
+    assert values["WS01"][4] == ""
+    # The Status column still carries the lockout detail too.
+    assert values["Locked User"][3] == "Enabled, Locked"
+
+
+def test_ad_search_clear_button_restores_full_list(root, patched_clients):
+    """The AD search row's clear (×) button empties the search text
+    and restores the full, unfiltered list."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+         "type": "user", "description": "Manager", "status": "Enabled"},
+    ]
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 2
+    app._ad_search_var.set("john")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 1
+    # One clear button per search row (AD, DHCP, DNS), in tab order;
+    # the first is the AD one.
+    assert len(app._search_clear_btns) == 3
+    assert app._search_clear_btns[0]["text"] == "×"
+    app._search_clear_btns[0].invoke()
+    assert app._ad_search_var.get() == ""
+    assert len(app.ad_list.get_children()) == 2
+
+
+def test_search_clear_buttons_exist_on_all_tabs(root, patched_clients):
+    """Every tab search row (AD, DHCP, DNS) has a clear (×) button
+    that empties its own search text; the buttons follow the search
+    entries' enabled/disabled state."""
+    app = MSATApp(root)
+    assert len(app._search_clear_btns) == 3
+    for btn in app._search_clear_btns:
+        assert btn["text"] == "×"
+        assert str(btn["state"]) == "disabled"  # disconnected
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    for btn in app._search_clear_btns:
+        assert str(btn["state"]) == "normal"
+    # Each button clears only its own tab's search text.
+    app._ad_search_var.set("john")
+    app._dhcp_search_var.set("scope")
+    app._dns_search_var.set("zone")
+    app._search_clear_btns[1].invoke()  # DHCP
+    assert app._dhcp_search_var.get() == ""
+    assert app._ad_search_var.get() == "john"
+    assert app._dns_search_var.get() == "zone"
+    app._search_clear_btns[2].invoke()  # DNS
+    assert app._dns_search_var.get() == ""
+    app._search_clear_btns[0].invoke()  # AD
+    assert app._ad_search_var.get() == ""
+    app._global_disconnect()
+    root.update_idletasks()
+    for btn in app._search_clear_btns:
+        assert str(btn["state"]) == "disabled"
+
+
+def test_attr_search_clear_button_restores_full_list(root):
+    """The Attribute Editor search box's clear (×) button empties
+    the search text and restores the full attribute list."""
+    from msat.dialogs import UserPropertiesDialog
+
+    attrs = {
+        "displayName": {"values": ["John Doe"], "binary": False},
+        "mail": {"values": ["jdoe@example.local"], "binary": False},
+        "title": {"values": ["Analyst"], "binary": False},
+    }
+    dlg = UserPropertiesDialog(root, "John Doe", attrs)
+    root.update_idletasks()
+    assert len(dlg._attr_tree.get_children()) == 3
+    dlg._attr_search_var.set("mail")
+    dlg._fill_attr_tree()
+    assert len(dlg._attr_tree.get_children()) == 1
+    assert dlg._attr_clear_btn["text"] == "×"
+    dlg._attr_clear_btn.invoke()
+    assert dlg._attr_search_var.get() == ""
+    assert len(dlg._attr_tree.get_children()) == 3
+    dlg._on_cancel()
+
+
+def test_user_properties_dialog_shows_lockout(root):
+    """The User Properties General tab shows the lockout state as a
+    read-only 'Locked out' row — Yes when lockoutTime is non-zero,
+    No otherwise — and it is never written back on Save."""
+    attrs_locked = {
+        "displayName": {"values": ["Locked User"], "binary": False},
+        "sAMAccountName": {"values": ["locked"], "binary": False},
+        "lockoutTime": {"values": ["133000000000000000"], "binary": False},
+    }
+    dlg = UserPropertiesDialog(root, "Locked User", attrs_locked)
+    root.update_idletasks()
+    assert dlg._lockout_entry.get() == "Yes"
+    assert str(dlg._lockout_entry["state"]) == "disabled"
+    # Not an editable General field, so Save cannot write it back.
+    assert "lockoutTime" not in dlg._general_entries
+    dlg._on_save()
+    assert "lockoutTime" not in (dlg.result or {})
+    attrs_unlocked = {
+        "displayName": {"values": ["John Doe"], "binary": False},
+        "sAMAccountName": {"values": ["jdoe"], "binary": False},
+        "lockoutTime": {"values": ["0"], "binary": False},
+    }
+    dlg2 = UserPropertiesDialog(root, "John Doe", attrs_unlocked)
+    root.update_idletasks()
+    assert dlg2._lockout_entry.get() == "No"
+    dlg2._on_cancel()
+    # Missing lockoutTime also means not locked.
+    attrs_missing = {
+        "displayName": {"values": ["Jane Doe"], "binary": False},
+        "sAMAccountName": {"values": ["jane"], "binary": False},
+    }
+    dlg3 = UserPropertiesDialog(root, "Jane Doe", attrs_missing)
+    root.update_idletasks()
+    assert dlg3._lockout_entry.get() == "No"
+    dlg3._on_cancel()
 
 
 def test_quiet_refresh_reports_failure_without_dialog(root, patched_clients,
