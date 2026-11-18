@@ -1,0 +1,4 @@
+# MSAT dependencies (pure Python, cross-platform).
+# Tested with Python 3.12; target is Python 3.11+ (user runs 3.15.2).
+ldap3>=2.9
+pywinrm>=0.5

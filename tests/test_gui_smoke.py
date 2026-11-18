@@ -1,0 +1,978 @@
+"""GUI smoke tests — build the real Tkinter UI under a virtual display.
+
+Run under xvfb (Linux) with:  xvfb-run -a pytest tests/test_gui_smoke.py
+On macOS these run against the real display.
+"""
+
+import tkinter as tk
+
+import pytest
+
+from msat.app import MSATApp
+from msat.constants import APP_TITLE
+from msat.dialogs import ConnectionDialog, SettingsDialog, UserPropertiesDialog
+from msat.settings import default_settings
+from tests.conftest import FakeWinRMClient
+
+
+class FakeADClient:
+    """Stand-in for ADClient: bind always succeeds, directory is empty."""
+
+    def __init__(self, server=None, domain=None, username=None, password=None,
+                 port=636, connection=None):
+        self.server = server
+        self.domain = domain
+        self._connected = False
+
+    def connect(self):
+        self._connected = True
+        return True
+
+    def validate_connection(self):
+        return True
+
+    def disconnect(self):
+        self._connected = False
+
+    def get_default_naming_context(self):
+        return "DC=example,DC=local"
+
+    def get_root_dse(self):
+        return {"defaultNamingContext": "DC=example,DC=local"}
+
+    def list_sites(self):
+        return []
+
+    def list_subnets(self):
+        return []
+
+    def list_trusted_domains(self):
+        return []
+
+    def list_children(self, dn):
+        return []
+
+
+class FakeWinRM(FakeWinRMClient):
+    """FakeWinRMClient that accepts WinRMClient's constructor arguments."""
+
+    def __init__(self, host, username=None, password=None, port=5985, **kwargs):
+        super().__init__()
+        self.host = host
+
+
+@pytest.fixture
+def root():
+    try:
+        r = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("No display available: {}".format(exc))
+    yield r
+    try:
+        r.destroy()
+    except tk.TclError:
+        pass
+
+
+@pytest.fixture
+def patched_clients(monkeypatch):
+    monkeypatch.setattr("msat.app.ADClient", FakeADClient)
+    monkeypatch.setattr("msat.app.WinRMClient", FakeWinRM)
+    # Role detection: dc1/dc2 have DNS + DHCP, dc3 has DNS only.
+    # (Matches the generic environment; a test can monkeypatch
+    # msat.app.detect_server_roles again to vary it.)
+    def _roles(client):
+        if getattr(client, "host", None) == "dc3":
+            return {"DNS": True, "DHCP": False}
+        return {"DNS": True, "DHCP": True}
+    monkeypatch.setattr("msat.app.detect_server_roles", _roles)
+
+
+@pytest.fixture(autouse=True)
+def generic_settings(monkeypatch):
+    """Pin the connection-bar defaults to the generic placeholders.
+
+    MSATApp loads the user's saved Settings on startup; without this,
+    a real ``~/.msat/settings.json`` in the test runner's home
+    would change the bar defaults and make these tests non-deterministic.
+    """
+    monkeypatch.setattr("msat.app.load_settings",
+                        lambda path=None: default_settings())
+
+
+def _all_toolbar_buttons(app):
+    return (app.ad_toolbar_buttons + app.dhcp_toolbar_buttons +
+            app.dns_toolbar_buttons + [app.info_refresh_btn])
+
+
+def _connect_app(app, server="dc1"):
+    app.server_var.set(server)
+    app.domain_var.set("example.local")
+    app.username_var.set("michael")
+    app.password_var.set("secret")
+    app._global_connect()
+    app.root.update_idletasks()
+
+
+def test_main_window_builds_with_all_tabs(root):
+    app = MSATApp(root)
+    assert root.title() == APP_TITLE
+    notebook = root.nametowidget("!notebook")
+    labels = [notebook.tab(i, "text") for i in range(notebook.index("end"))]
+    assert labels == ["AD Users & Computers", "DHCP", "DNS",
+                      "Directory Info"]
+    # One global connection bar: Connect enabled, Disconnect disabled,
+    # status "Not connected". All tab toolbars start disabled.
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+    assert app.conn_status["text"] == "Not connected"
+    assert app.server_var.get() == "dc1"
+    assert app.domain_var.get() == "example.local"
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "disabled"
+    # A single credential store, shared by all tabs, initially empty.
+    assert isinstance(app.creds, object)
+    assert not app.creds.is_set
+    assert app.ad_client is None
+    assert app.dhcp is None
+    assert app.dns is None
+    # DHCP server picker is hidden until a dc3 connection needs it.
+    assert app.dhcp_server_frame.winfo_manager() == ""
+    root.update_idletasks()
+
+
+def test_global_connect_enables_all_tabs_then_disconnect_disables(root,
+                                                                  patched_clients):
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+    assert app.creds.is_set
+    assert str(app.connect_btn["state"]) == "disabled"
+    assert str(app.disconnect_btn["state"]) == "normal"
+    assert app.conn_status["text"] == "Connected to dc1"
+    assert "Connected to dc1" in app.statusbar["text"]
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "normal"
+    # The AD tree root was populated from the (fake) directory.
+    assert app.ad_tree.exists("DC=example,DC=local")
+
+    app._global_disconnect()
+    root.update_idletasks()
+    assert app.ad_client is None
+    assert app.dhcp is None
+    assert app.dns is None
+    assert not app.creds.is_set
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+    assert app.conn_status["text"] == "Not connected"
+    assert app.statusbar["text"] == "Disconnected."
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "disabled"
+    assert not app.ad_tree.get_children()
+
+
+def test_global_connect_rejects_bad_credentials(root, patched_clients,
+                                                monkeypatch):
+    """A failed LDAP bind must not mark the app connected."""
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+
+    class FailingADClient(FakeADClient):
+        def connect(self):
+            raise Exception("Could not connect to dc1 over LDAPS (port 636): "
+                            "invalidCredentials")
+
+    monkeypatch.setattr("msat.app.ADClient", FailingADClient)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is None
+    assert not app.creds.is_set
+    assert shown, "expected an error dialog for the failed bind"
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "disabled"
+
+
+def test_global_connect_invalid_credentials_message(root, patched_clients,
+                                                  monkeypatch):
+    """A bind rejected for bad credentials gets the plain-language dialog
+    and a visible 'Connection failed: invalid credentials' status."""
+    from msat.ldap_client import ADInvalidCredentialsError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+
+    class BadCredsADClient(FakeADClient):
+        def connect(self):
+            raise ADInvalidCredentialsError(
+                "Invalid credentials — the username or password is "
+                "incorrect for dc1.")
+
+    monkeypatch.setattr("msat.app.ADClient", BadCredsADClient)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is None
+    assert not app.creds.is_set
+    assert app.dns is None and app.dhcp is None
+    assert not app.ad_tree.get_children()
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "disabled"
+    assert shown, "expected the invalid-credentials dialog"
+    title, message = shown[0][0], shown[0][1]
+    assert title == "Invalid credentials"
+    assert "username or password is incorrect" in message
+    assert app.conn_status["text"] == "Connection failed: invalid credentials"
+    assert "invalid credentials" in app.statusbar["text"].lower()
+
+
+def test_global_connect_validation_search_failure_stays_disconnected(
+        root, patched_clients, monkeypatch):
+    """A bind that succeeds but a validation search that fails for
+    credentials must also abort the connect before anything loads."""
+    from msat.ldap_client import ADInvalidCredentialsError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+
+    class StaleCredsADClient(FakeADClient):
+        def validate_connection(self):
+            raise ADInvalidCredentialsError(
+                "Invalid credentials — the username or password is "
+                "incorrect for dc1.")
+
+    monkeypatch.setattr("msat.app.ADClient", StaleCredsADClient)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is None
+    assert not app.creds.is_set
+    assert not app.ad_tree.get_children()
+    assert shown and shown[0][0] == "Invalid credentials"
+    assert app.conn_status["text"] == "Connection failed: invalid credentials"
+
+
+def test_dhcp_uses_global_server_when_it_has_dhcp(root, patched_clients):
+    app = MSATApp(root)
+    _connect_app(app, "dc2")
+    root.update_idletasks()
+    # dc2 runs DHCP: no picker, DHCP targets the global server.
+    assert app.dhcp_server_frame.winfo_manager() == ""
+    assert app._dhcp_server == "dc2"
+    assert app.dhcp_server_var.get() == "dc2"
+
+
+def test_dhcp_falls_back_to_picker_when_global_server_is_dc3(root,
+                                                             patched_clients):
+    app = MSATApp(root)
+    _connect_app(app, "dc3")
+    root.update_idletasks()
+    # dc3 has no DHCP: the picker appears, defaulting to dc1,
+    # and the DHCP manager targets dc1 with the global credentials.
+    assert app.dhcp_server_frame.winfo_manager() == "pack"
+    assert app.dhcp_server_var.get() == "dc1"
+    assert app._dhcp_server == "dc1"
+    assert app.creds.is_set
+
+    # Switching the picker to the other DHCP server retargets DHCP.
+    app.dhcp_server_var.set("dc2")
+    app._dhcp_on_server_change()
+    root.update_idletasks()
+    assert app._dhcp_server == "dc2"
+
+
+def test_connection_dialog_builds_and_cancels(root):
+    dlg = ConnectionDialog(root, "Connect to Active Directory",
+                           ["dc1", "dc2", "dc3"],
+                           "dc1", "example.local", 636, "LDAPS port")
+    root.update_idletasks()
+    assert dlg.server.get() == "dc1"
+    assert dlg.domain.get() == "example.local"
+    assert dlg.port.get() == "636"
+    dlg._on_cancel()
+    assert dlg.result is None
+
+
+def test_connection_dialog_validates_port(root, monkeypatch):
+    # messagebox calls are modal and would block the test forever under
+    # xvfb, so stub them out and assert they were invoked instead.
+    shown = []
+    monkeypatch.setattr("msat.dialogs.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    dlg = ConnectionDialog(root, "Connect", ["dc1"], "dc1",
+                           "example.local", 636, "LDAPS port")
+    dlg.username.insert(0, "michael")
+    dlg.password.insert(0, "secret")
+    dlg.port.delete(0, tk.END)
+    dlg.port.insert(0, "not-a-port")
+    assert dlg.validate() is False
+    assert shown, "expected a warning about the invalid port"
+    dlg._on_cancel()
+
+
+def test_user_properties_dialog_diff(root):
+    """General-tab edits + cleared attributes produce a change-only diff."""
+    attrs = {
+        "displayName": {"values": ["John Doe"], "binary": False},
+        "sAMAccountName": {"values": ["jdoe"], "binary": False},
+        "mail": {"values": ["jdoe@example.local"], "binary": False},
+        "title": {"values": ["Analyst"], "binary": False},
+        "proxyAddresses": {"values": ["SMTP:jdoe@example.local",
+                                      "smtp:jdoe@mail.example.local"],
+                           "binary": False},
+        "objectGUID": {"values": ["000102030405060708090a0b0c0d0e0f"],
+                       "binary": True},
+    }
+    dlg = UserPropertiesDialog(root, "John Doe", attrs)
+    root.update_idletasks()
+    assert dlg._general_entries["displayName"].get() == "John Doe"
+    assert dlg._general_entries["sAMAccountName"].get() == "jdoe"
+    assert str(dlg._general_entries["sAMAccountName"]["state"]) == "disabled"
+    # Binary rows are listed but flagged read-only.
+    assert "(binary, read-only)" in dlg._attr_tree.item(
+        "objectGUID", "values")[1]
+    # Edit the title, clear mail (via the editor values + sync).
+    dlg._general_entries["title"].delete(0, tk.END)
+    dlg._general_entries["title"].insert(0, "Lead Analyst")
+    dlg._values["mail"] = None
+    dlg._sync_general_entry("mail")
+    dlg._on_save()
+    assert dlg.result == {"title": ["Lead Analyst"], "mail": None}
+
+
+def test_user_properties_dialog_cancel(root):
+    attrs = {"displayName": {"values": ["John Doe"], "binary": False}}
+    dlg = UserPropertiesDialog(root, "John Doe", attrs)
+    dlg._on_cancel()
+    assert dlg.result is None
+
+
+def test_search_entries_enable_with_connection(root, patched_clients):
+    app = MSATApp(root)
+    assert len(app._search_entries) == 3  # AD, DHCP, DNS
+    for entry in app._search_entries:
+        assert str(entry["state"]) == "disabled"
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    for entry in app._search_entries:
+        assert str(entry["state"]) == "normal"
+    app._global_disconnect()
+    root.update_idletasks()
+    for entry in app._search_entries:
+        assert str(entry["state"]) == "disabled"
+
+
+def test_ad_search_filters_rows(root, patched_clients):
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+         "type": "user", "description": "Manager", "status": "Enabled"},
+    ]
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 2
+    app._ad_search_var.set("john")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 1
+    app._ad_search_var.set("MANAGER")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 1  # case-insensitive
+    app._ad_search_var.set("zzzz")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 0
+    app._ad_search_var.set("")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 2  # clearing restores all
+
+
+def test_quiet_refresh_reports_failure_without_dialog(root, patched_clients,
+                                                     monkeypatch):
+    """A failing tab load during connect is a status message, not a modal."""
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert not shown
+
+    class Boom:
+        def list_zones(self):
+            raise Exception("DNS zone list failed: access denied.")
+
+    app.dns = Boom()
+    result = app._dns_refresh(quiet=True)
+    assert result is not True
+    assert "access denied" in str(result)
+    assert not shown, "quiet refresh must not pop a dialog"
+    assert "DNS zone list failed" in app.statusbar["text"]
+    # The loud (toolbar Refresh) path still shows the modal.
+    app._dns_refresh()
+    assert shown, "explicit Refresh should show the error dialog"
+
+
+def test_nested_tree_open_populates_depth_two_placeholder(root,
+                                                          patched_clients):
+    """Expanding a nested OU replaces its 'Loading…' placeholder (v1.4).
+
+    Regression test: the v1.3 open handler resolved the opened node via
+    focus/selection, which failed for nested nodes (focus stays on the
+    parent), so EXAMPLE > Users kept a stuck placeholder. The handler now
+    scans the whole tree for open nodes with a placeholder, regardless
+    of depth or which node has focus.
+    """
+    import tkinter as tk
+
+    from msat.app import _LOADING_SUFFIX
+
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+
+    class NestedAD(FakeADClient):
+        def list_children(self, dn):
+            if dn == "OU=Users,OU=EXAMPLE,DC=example,DC=local":
+                return [{"dn": "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local",
+                         "type": "ou"}]
+            return []
+
+    app.ad_client = NestedAD()
+    root_dn = "DC=example,DC=local"
+    example_dn = "OU=EXAMPLE,DC=example,DC=local"
+    users_dn = "OU=Users,OU=EXAMPLE,DC=example,DC=local"
+    # Rebuild the tree: root > EXAMPLE > Users (open, placeholder child).
+    app._clear_tree(app.ad_tree)
+    app.ad_tree.insert("", tk.END, iid=root_dn, text="example", open=True)
+    app.ad_tree.insert(root_dn, tk.END, iid=example_dn, text="EXAMPLE",
+                       open=True)
+    app.ad_tree.insert(example_dn, tk.END, iid=users_dn, text="Users",
+                       open=True)
+    app.ad_tree.insert(users_dn, tk.END,
+                       iid=users_dn + _LOADING_SUFFIX, text="Loading…")
+    # Focus stays on the root (the v1.3 failure mode): the handler must
+    # not depend on it.
+    app.ad_tree.focus(root_dn)
+    app.ad_tree.selection_set(root_dn)
+    root.update_idletasks()
+
+    app._ad_on_tree_open(None)
+    root.update_idletasks()
+
+    children = app.ad_tree.get_children(users_dn)
+    assert users_dn + _LOADING_SUFFIX not in children
+    assert "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local" in children
+
+
+def test_tree_open_deferred_populates_depth_one_and_two(root, patched_clients):
+    """The open handler defers to idle so it sees the settled open state.
+
+    Regression test (v1.5): in v1.4 the handler scanned synchronously
+    from <<TreeviewOpen>>, which can fire before the clicked node's
+    open state settles — Builtin (depth 1) kept a stuck placeholder
+    even though the root's children loaded. The handler now defers
+    the scan with after_idle, so by the time it runs the open state
+    has settled for the node that was just expanded, at any depth.
+    """
+    import tkinter as tk
+
+    from msat.app import _LOADING_SUFFIX
+
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+
+    class NestedAD(FakeADClient):
+        def list_children(self, dn):
+            if dn == "CN=Builtin,DC=example,DC=local":
+                return []  # Builtin holds only groups: tree stays empty
+            if dn == "OU=Users,OU=EXAMPLE,DC=example,DC=local":
+                return [{"dn": "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local",
+                         "name": "Sub", "type": "ou",
+                         "description": "", "status": ""}]
+            return []
+
+    app.ad_client = NestedAD()
+    root_dn = "DC=example,DC=local"
+    builtin_dn = "CN=Builtin,DC=example,DC=local"
+    example_dn = "OU=EXAMPLE,DC=example,DC=local"
+    users_dn = "OU=Users,OU=EXAMPLE,DC=example,DC=local"
+    app._clear_tree(app.ad_tree)
+    app.ad_tree.insert("", tk.END, iid=root_dn, text="example", open=True)
+    app.ad_tree.insert(root_dn, tk.END, iid=builtin_dn, text="Builtin",
+                       open=False)
+    app.ad_tree.insert(builtin_dn, tk.END,
+                       iid=builtin_dn + _LOADING_SUFFIX, text="Loading…")
+    app.ad_tree.insert(root_dn, tk.END, iid=example_dn, text="EXAMPLE",
+                       open=True)
+    app.ad_tree.insert(example_dn, tk.END, iid=users_dn, text="Users",
+                       open=False)
+    app.ad_tree.insert(users_dn, tk.END,
+                       iid=users_dn + _LOADING_SUFFIX, text="Loading…")
+    root.update_idletasks()
+
+    # Simulate <<TreeviewOpen>> firing BEFORE the open state settles:
+    # the handler runs, then the state settles, then idle callbacks run.
+    app._ad_on_tree_open(None)
+    app.ad_tree.item(builtin_dn, open=True)
+    app.ad_tree.item(users_dn, open=True)
+    root.update_idletasks()
+
+    builtin_children = app.ad_tree.get_children(builtin_dn)
+    assert builtin_dn + _LOADING_SUFFIX not in builtin_children
+    assert builtin_children == ()  # groups only: expanded but empty
+    users_children = app.ad_tree.get_children(users_dn)
+    assert users_dn + _LOADING_SUFFIX not in users_children
+    assert "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local" in users_children
+
+
+def test_tree_open_failure_in_one_node_does_not_abort_scan(
+        root, patched_clients, monkeypatch):
+    """One node's populate failure must not stop other nodes loading."""
+    import tkinter as tk
+
+    from msat.app import _LOADING_SUFFIX
+
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+
+    class FlakyAD(FakeADClient):
+        def list_children(self, dn):
+            if dn == "CN=Builtin,DC=example,DC=local":
+                raise Exception("LDAP search failed: operationsError")
+            if dn == "OU=Users,OU=EXAMPLE,DC=example,DC=local":
+                return [{"dn": "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local",
+                         "name": "Sub", "type": "ou",
+                         "description": "", "status": ""}]
+            return []
+
+    app.ad_client = FlakyAD()
+    root_dn = "DC=example,DC=local"
+    builtin_dn = "CN=Builtin,DC=example,DC=local"
+    users_dn = "OU=Users,OU=EXAMPLE,DC=example,DC=local"
+    app._clear_tree(app.ad_tree)
+    app.ad_tree.insert("", tk.END, iid=root_dn, text="example", open=True)
+    app.ad_tree.insert(root_dn, tk.END, iid=builtin_dn, text="Builtin",
+                       open=True)
+    app.ad_tree.insert(builtin_dn, tk.END,
+                       iid=builtin_dn + _LOADING_SUFFIX, text="Loading…")
+    app.ad_tree.insert(root_dn, tk.END, iid=users_dn, text="Users",
+                       open=True)
+    app.ad_tree.insert(users_dn, tk.END,
+                       iid=users_dn + _LOADING_SUFFIX, text="Loading…")
+    root.update_idletasks()
+
+    app._ad_on_tree_open(None)
+    root.update_idletasks()
+
+    # Users still populated despite Builtin failing.
+    users_children = app.ad_tree.get_children(users_dn)
+    assert "OU=Sub,OU=Users,OU=EXAMPLE,DC=example,DC=local" in users_children
+    # Builtin kept its placeholder for a retry (the failure path
+    # re-inserts it) and exactly one error dialog was shown.
+    builtin_children = app.ad_tree.get_children(builtin_dn)
+    assert builtin_dn + _LOADING_SUFFIX in builtin_children
+    assert len(shown) == 1
+
+
+def test_properties_attr_search_filters_and_preserves_edits(root):
+    """Attribute Editor search narrows by name; edits survive filtering."""
+    from msat.dialogs import UserPropertiesDialog
+
+    attrs = {
+        "displayName": {"values": ["John Doe"], "binary": False},
+        "mail": {"values": ["jdoe@example.local"], "binary": False},
+        "proxyAddresses": {"values": ["SMTP:jdoe@example.local",
+                                      "smtp:jdoe@mail.example.local"],
+                           "binary": False},
+        "title": {"values": ["Analyst"], "binary": False},
+    }
+    dlg = UserPropertiesDialog(root, "John Doe", attrs)
+    root.update_idletasks()
+    assert len(dlg._attr_tree.get_children()) == 4
+    # Filter by attribute name.
+    dlg._attr_search_var.set("proxy")
+    dlg._fill_attr_tree()
+    rows = dlg._attr_tree.get_children()
+    assert len(rows) == 1
+    assert dlg._attr_tree.item(rows[0], "values")[0] == "proxyAddresses"
+    # Edit a value while filtered, then clear: the edit is kept.
+    dlg._values["title"] = ["Lead Analyst"]
+    dlg._attr_search_var.set("")
+    dlg._fill_attr_tree()
+    assert len(dlg._attr_tree.get_children()) == 4
+    assert dlg._values["title"] == ["Lead Analyst"]
+    # Value text also matches (SMTP appears in proxyAddresses values).
+    dlg._attr_search_var.set("smtp:")
+    dlg._fill_attr_tree()
+    rows = dlg._attr_tree.get_children()
+    assert len(rows) == 1
+    assert dlg._attr_tree.item(rows[0], "values")[0] == "proxyAddresses"
+    dlg._on_cancel()
+
+
+def test_group_properties_dialog_shows_members(root):
+    """Group Properties opens with General, Members and Attribute Editor."""
+    from msat.dialogs import GroupPropertiesDialog
+
+    attrs = {
+        "displayName": {"values": ["IT Admins"], "binary": False},
+        "sAMAccountName": {"values": ["ITAdmins"], "binary": False},
+        "description": {"values": ["IT administrators"], "binary": False},
+        "groupType": {"values": ["-2147483646"], "binary": False},
+        "distinguishedName": {"values": ["CN=IT Admins,OU=Groups,DC=example,DC=local"],
+                              "binary": False},
+        "member": {"values": ["CN=jdoe,OU=Users,DC=example,DC=local"],
+                   "binary": False},
+        "objectGUID": {"values": ["000102030405060708090a0b0c0d0e0f"],
+                       "binary": True},
+    }
+    members = [{"dn": "CN=jdoe,OU=Users,DC=example,DC=local",
+                "name": "John Doe", "sam": "jdoe",
+                "display_name": "John Doe", "type": "user"}]
+
+    class FakeClient:
+        def add_group_member(self, group_dn, member_dn):
+            raise AssertionError("no membership change expected")
+        def remove_group_member(self, group_dn, member_dn):
+            raise AssertionError("no membership change expected")
+        def search_users(self, base_dn, query):
+            return []
+        def search_groups(self, base_dn, query):
+            return []
+
+    dlg = GroupPropertiesDialog(root, "IT Admins", attrs, FakeClient(),
+                                "DC=example,DC=local",
+                                "CN=IT Admins,OU=Groups,DC=example,DC=local",
+                                members)
+    root.update_idletasks()
+    # Members tab lists the resolved member.
+    rows = dlg._member_tree.get_children()
+    assert len(rows) == 1
+    values = dlg._member_tree.item(rows[0], "values")
+    assert values[0] == "John Doe"
+    assert values[1] == "jdoe"
+    assert values[2] == "User"
+    # General tab shows the group type label.
+    assert "Global security" in dlg._group_type_label()
+    # Attribute Editor lists member as read-only.
+    assert "(read-only)" in dlg._attr_tree.item("member", "values")[1]
+    # Editing displayName produces a change-only diff (member excluded).
+    dlg._general_entries["displayName"].delete(0, tk.END)
+    dlg._general_entries["displayName"].insert(0, "IT Admins 2")
+    dlg._on_save()
+    assert dlg.result == {"displayName": ["IT Admins 2"]}
+    assert dlg.membership_changes == []
+
+
+def test_group_properties_add_remove_member_applies_immediately(
+        root, monkeypatch):
+    """Members tab Add/Remove call the client immediately and update the list."""
+    from msat import dialogs
+    from msat.dialogs import GroupPropertiesDialog
+
+    group_dn = "CN=IT Admins,OU=Groups,DC=example,DC=local"
+    attrs = {
+        "displayName": {"values": ["IT Admins"], "binary": False},
+        "sAMAccountName": {"values": ["ITAdmins"], "binary": False},
+        "member": {"values": ["CN=jdoe,OU=Users,DC=example,DC=local"],
+                   "binary": False},
+    }
+    members = [{"dn": "CN=jdoe,OU=Users,DC=example,DC=local",
+                "name": "John Doe", "sam": "jdoe",
+                "display_name": "John Doe", "type": "user"}]
+
+    class FakeClient:
+        def __init__(self):
+            self.added = []
+            self.removed = []
+        def add_group_member(self, group_dn, member_dn):
+            self.added.append((group_dn, member_dn))
+        def remove_group_member(self, group_dn, member_dn):
+            self.removed.append((group_dn, member_dn))
+        def search_users(self, base_dn, query):
+            return []
+        def search_groups(self, base_dn, query):
+            return []
+
+    client = FakeClient()
+    dlg = GroupPropertiesDialog(root, "IT Admins", attrs, client,
+                                "DC=example,DC=local", group_dn, members)
+    root.update_idletasks()
+    assert len(dlg._member_tree.get_children()) == 1
+
+    # Add Alice via the picker (stubbed to return her immediately).
+    new_member = {"dn": "CN=asmith,OU=Users,DC=example,DC=local",
+                  "name": "Alice Smith", "sam": "asmith",
+                  "display_name": "Alice Smith", "type": "user"}
+
+    class FakePicker:
+        def __init__(self, *a, **k):
+            self.result = new_member
+        def wait_window(self):
+            pass
+
+    monkeypatch.setattr(dialogs, "MemberPickerDialog", FakePicker)
+    dlg._on_add_member()
+    assert client.added == [(group_dn, "CN=asmith,OU=Users,DC=example,DC=local")]
+    assert len(dlg._member_tree.get_children()) == 2
+    assert dlg.membership_changes == [("added", "Alice Smith")]
+    # The Attribute Editor's member row stays in sync.
+    assert "CN=asmith" in dlg._attr_tree.item("member", "values")[1]
+
+    # Remove John: select his row and confirm the prompt.
+    monkeypatch.setattr("msat.dialogs.messagebox.askyesno",
+                        lambda *a, **k: True)
+    dlg._member_tree.selection_set("CN=jdoe,OU=Users,DC=example,DC=local")
+    dlg._on_remove_member()
+    assert client.removed == [(group_dn, "CN=jdoe,OU=Users,DC=example,DC=local")]
+    assert len(dlg._member_tree.get_children()) == 1
+    assert dlg.membership_changes[-1] == ("removed", "John Doe")
+    dlg._on_cancel()
+
+
+def test_double_click_routes_group_vs_user(root, patched_clients, monkeypatch):
+    """Double-clicking a group opens Group Properties; a user opens User Properties."""
+    from msat import dialogs
+
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    opened = []
+
+    class FakeUserDlg:
+        def __init__(self, *a, **k):
+            opened.append("user")
+            self.result = None
+        def wait_window(self):
+            pass
+
+    class FakeGroupDlg:
+        def __init__(self, *a, **k):
+            opened.append("group")
+            self.result = None
+            self.membership_changes = []
+        def wait_window(self):
+            pass
+
+    monkeypatch.setattr(dialogs, "UserPropertiesDialog", FakeUserDlg)
+    monkeypatch.setattr(dialogs, "GroupPropertiesDialog", FakeGroupDlg)
+    app.ad_client.get_object_attributes = lambda dn: {}
+    app.ad_client.resolve_members = lambda dns: []
+    app._ad_rows = [
+        {"dn": "CN=jdoe,OU=Users,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "", "status": "Enabled"},
+        {"dn": "CN=Admins,OU=IT,DC=example,DC=local", "name": "Admins",
+         "type": "group", "description": "", "status": ""},
+    ]
+    app._ad_apply_filter()
+    # Double-click the user row.
+    app.ad_list.selection_set("CN=jdoe,OU=Users,DC=example,DC=local")
+    app._ad_on_list_double_click(None)
+    assert opened == ["user"]
+    # Double-click the group row.
+    app.ad_list.selection_set("CN=Admins,OU=IT,DC=example,DC=local")
+    app._ad_on_list_double_click(None)
+    assert opened == ["user", "group"]
+
+
+def test_edit_reservation_dialog_prefills_fields(root):
+    """Edit Reservation dialog is pre-filled with the current values."""
+    from msat.dialogs import EditReservationDialog
+
+    dlg = EditReservationDialog(root, "192.168.1.0", {
+        "IPAddress": "192.168.1.50", "Name": "Printer",
+        "ClientId": "AA-BB-CC-DD-EE-FF", "Description": "Front printer"})
+    root.update_idletasks()
+    assert dlg.ip.get() == "192.168.1.50"
+    assert dlg.mac.get() == "AA-BB-CC-DD-EE-FF"
+    assert dlg.name.get() == "Printer"
+    assert dlg.description.get() == "Front printer"
+    dlg._on_cancel()
+
+
+def test_edit_record_dialog_prefills_fields(root):
+    """Edit Record dialog is pre-filled; name/type are read-only."""
+    from msat.dialogs import EditRecordDialog
+
+    dlg = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": 3600.0,
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    root.update_idletasks()
+    assert dlg._name == "dc1" and dlg._rtype == "A"
+    assert dlg.data.get() == "192.168.1.10"
+    assert dlg.ttl.get() == "3600"
+    dlg._on_cancel()
+
+    # MX splits the display value into host + preference.
+    dlg = EditRecordDialog(root, "example.local", {
+        "HostName": "@", "RecordType": "MX", "TTL": 3600.0,
+        "Data": "10 mail.example.local", "RemoveData": "mail.example.local"})
+    root.update_idletasks()
+    assert dlg.data.get() == "mail.example.local"
+    assert dlg.preference.get() == "10"
+    dlg._on_cancel()
+
+
+# -- role detection and tab gating (v1.8.0) ----------------------------------
+
+def _button_states(buttons):
+    return {btn["text"]: str(btn["state"]) for btn in buttons}
+
+
+def test_dns_tab_disabled_when_dns_role_absent(root, patched_clients,
+                                              monkeypatch):
+    """A server without the DNS role gets a gated DNS tab (note + tools
+    disabled, Refresh stays enabled); AD and Directory Info stay on."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": False, "DHCP": True})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._dns_enabled is False
+    assert app._dhcp_enabled is True
+    states = _button_states(app.dns_toolbar_buttons)
+    assert states["Refresh"] == "normal"
+    assert states["Add Record"] == "disabled"
+    assert states["Edit Record"] == "disabled"
+    assert states["Remove Record"] == "disabled"
+    assert str(app._dns_search_entry["state"]) == "disabled"
+    assert "dc1" in app.dns_note["text"]
+    assert "DNS Server role" in app.dns_note["text"]
+    assert "DNS tab disabled" in app.dns_note["text"]
+    assert "DNS Server role is not installed on dc1" in app.statusbar["text"]
+    # AD and Directory Info are unaffected by a missing DNS role.
+    assert all(str(b["state"]) == "normal" for b in app.ad_toolbar_buttons)
+    assert str(app.info_refresh_btn["state"]) == "normal"
+
+
+def test_dhcp_tab_disabled_when_no_server_has_dhcp(root, patched_clients,
+                                                   monkeypatch):
+    """No DHCP role anywhere: the DHCP tab is gated with a note naming
+    the missing role; DNS and AD stay on."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": True, "DHCP": False})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._dhcp_enabled is False
+    assert app._dns_enabled is True
+    assert app._dhcp_candidates == []
+    states = _button_states(app.dhcp_toolbar_buttons)
+    assert states["Refresh"] == "normal"
+    assert states["Add Reservation"] == "disabled"
+    assert states["Edit Reservation"] == "disabled"
+    assert states["Remove Reservation"] == "disabled"
+    assert states["Superscopes"] == "disabled"
+    assert "DHCP Server role" in app.dhcp_note["text"]
+    assert "DHCP tab disabled" in app.dhcp_note["text"]
+    assert "DHCP Server role is not installed" in app.statusbar["text"]
+    # The picker is hidden when there is no DHCP server to pick.
+    assert app.dhcp_server_frame.winfo_manager() == ""
+    # DNS still loads.
+    assert all(str(b["state"]) == "normal" for b in app.dns_toolbar_buttons)
+
+
+def test_detection_unavailable_leaves_all_tabs_enabled(root, patched_clients,
+                                                       monkeypatch):
+    """When role detection itself fails, the connection is not broken
+    and no tab is disabled — the app falls back to all tabs enabled
+    and says so in the status bar."""
+    from msat.winrm_client import WinRMError
+
+    def _boom(client):
+        raise WinRMError("WinRM request to {} failed: connection refused"
+                         .format(client.host))
+
+    monkeypatch.setattr("msat.app.detect_server_roles", _boom)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+    assert app._roles_available is False
+    assert app._dns_enabled is True
+    assert app._dhcp_enabled is True
+    assert app._dhcp_server == "dc1"
+    for btn in _all_toolbar_buttons(app):
+        assert str(btn["state"]) == "normal"
+    assert "Role detection unavailable" in app.statusbar["text"]
+
+
+def test_dhcp_refresh_rechecks_missing_role(root, patched_clients,
+                                            monkeypatch):
+    """Refresh on a gated DHCP tab re-runs discovery; if a DHCP server
+    is found now, the tab is enabled and loads."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": True, "DHCP": False})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._dhcp_enabled is False
+
+    # The DHCP role is installed on dc1 afterwards.
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": True, "DHCP": True})
+    result = app._dhcp_refresh()
+    root.update_idletasks()
+    assert result is True
+    assert app._dhcp_enabled is True
+    assert app._dhcp_server == "dc1"
+    assert all(str(b["state"]) == "normal" for b in app.dhcp_toolbar_buttons)
+    assert "Loaded 0 DHCP scope(s)." in app.statusbar["text"]
+
+
+def test_dns_refresh_rechecks_missing_role(root, patched_clients,
+                                           monkeypatch):
+    """Refresh on a gated DNS tab re-checks the role; if it is present
+    now, the tab is enabled and loads."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": False, "DHCP": True})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._dns_enabled is False
+
+    # The DNS role is installed on dc1 afterwards.
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": True, "DHCP": True})
+    result = app._dns_refresh()
+    root.update_idletasks()
+    assert result is True
+    assert app._dns_enabled is True
+    assert app.dns_note["text"] == ""
+    assert all(str(b["state"]) == "normal" for b in app.dns_toolbar_buttons)
+    assert "Loaded 0 DNS zone(s)." in app.statusbar["text"]
+
+
+def test_ad_tab_always_enabled_when_both_roles_missing(root, patched_clients,
+                                                       monkeypatch):
+    """AD and Directory Info never depend on role detection."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": False, "DHCP": False})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._dns_enabled is False
+    assert app._dhcp_enabled is False
+    assert all(str(b["state"]) == "normal" for b in app.ad_toolbar_buttons)
+    assert str(app.info_refresh_btn["state"]) == "normal"
+    assert app.ad_tree.exists("DC=example,DC=local")
