@@ -152,8 +152,13 @@ def test_global_connect_enables_all_tabs_then_disconnect_disables(root,
     assert str(app.disconnect_btn["state"]) == "normal"
     assert app.conn_status["text"] == "Connected to dc1"
     assert "Connected to dc1" in app.statusbar["text"]
-    for btn in _all_toolbar_buttons(app):
+    # DHCP/DNS/Info toolbars are fully enabled on connect.
+    for btn in (app.dhcp_toolbar_buttons + app.dns_toolbar_buttons +
+                [app.info_refresh_btn]):
         assert str(btn["state"]) == "normal"
+    # AD: the buttons that need no selection are enabled; the row
+    # actions are disabled until a row is selected (v1.8.7).
+    _assert_ad_buttons_no_selection(app)
     # The AD tree root was populated from the (fake) directory.
     assert app.ad_tree.exists("DC=example,DC=local")
 
@@ -1095,6 +1100,26 @@ def _button_states(buttons):
     return {btn["text"]: str(btn["state"]) for btn in buttons}
 
 
+def _assert_ad_buttons_no_selection(app):
+    """AD toolbar state with no row selected (v1.8.7 selection gating):
+    the buttons that need no selection are enabled; the row actions
+    (Enable / Disable / Unlock / Reset Password / Add to Group /
+    Move / Properties / Delete) are disabled until a row is selected."""
+    states = _button_states(app.ad_toolbar_buttons)
+    for label in ("New User", "New Computer", "New Group", "Refresh"):
+        assert states[label] == "normal", label
+    for label in ("Enable", "Disable", "Unlock", "Reset Password",
+                  "Add to Group", "Move...", "Properties", "Delete"):
+        assert states[label] == "disabled", label
+
+
+def _assert_ad_buttons_with_selection(app):
+    """AD toolbar state with a row selected: every button enabled."""
+    states = _button_states(app.ad_toolbar_buttons)
+    for label, state in states.items():
+        assert state == "normal", label
+
+
 def test_dns_tab_disabled_when_dns_role_absent(root, patched_clients,
                                               monkeypatch):
     """A server without the DNS role gets a gated DNS tab (note + tools
@@ -1117,8 +1142,10 @@ def test_dns_tab_disabled_when_dns_role_absent(root, patched_clients,
     assert "DNS Server role" in app.dns_note["text"]
     assert "DNS tab disabled" in app.dns_note["text"]
     assert "DNS Server role is not installed on dc1" in app.statusbar["text"]
-    # AD and Directory Info are unaffected by a missing DNS role.
-    assert all(str(b["state"]) == "normal" for b in app.ad_toolbar_buttons)
+    # AD and Directory Info are unaffected by a missing DNS role:
+    # the AD buttons follow the connected state (the row actions are
+    # disabled only because nothing is selected, v1.8.7).
+    _assert_ad_buttons_no_selection(app)
     assert str(app.info_refresh_btn["state"]) == "normal"
 
 
@@ -1170,8 +1197,13 @@ def test_detection_unavailable_leaves_all_tabs_enabled(root, patched_clients,
     assert app._dns_enabled is True
     assert app._dhcp_enabled is True
     assert app._dhcp_server == "dc1"
-    for btn in _all_toolbar_buttons(app):
+    # DHCP/DNS/Info toolbars are fully enabled; AD follows the
+    # connected state (row actions disabled only because nothing is
+    # selected, v1.8.7).
+    for btn in (app.dhcp_toolbar_buttons + app.dns_toolbar_buttons +
+                [app.info_refresh_btn]):
         assert str(btn["state"]) == "normal"
+    _assert_ad_buttons_no_selection(app)
     assert "Role detection unavailable" in app.statusbar["text"]
 
 
@@ -1236,7 +1268,10 @@ def test_ad_tab_always_enabled_when_both_roles_missing(root, patched_clients,
     root.update_idletasks()
     assert app._dns_enabled is False
     assert app._dhcp_enabled is False
-    assert all(str(b["state"]) == "normal" for b in app.ad_toolbar_buttons)
+    # AD is not gated by the missing roles: its buttons follow the
+    # connected state (row actions disabled only because nothing is
+    # selected, v1.8.7).
+    _assert_ad_buttons_no_selection(app)
     assert str(app.info_refresh_btn["state"]) == "normal"
     assert app.ad_tree.exists("DC=example,DC=local")
 
@@ -1581,6 +1616,40 @@ def test_disconnect_cancels_pending_search_debounce(root, patched_clients,
     assert len(app.ad_list.get_children()) == 0
 
 
+def test_disconnect_with_pending_debounce_then_destroy_succeeds(
+        root, patched_clients):
+    """Disconnect with a pending search debounce must not break a
+    later root.destroy() (v1.8.7 regression): the debounce timer is
+    scheduled with entry.after, and cancelling it via
+    root.after_cancel corrupted Tcl's callback bookkeeping, so
+    destroy() raised "can't delete Tcl command" and left the window
+    (and its pending startup update check) alive — which then fired
+    during a later test and opened a second update dialog."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+    ]
+    app._ad_apply_filter()
+    entry = app._search_entries[0]  # AD search entry
+    entry.focus_force()
+    app._ad_search_var.set("john")
+    entry.event_generate("<KeyRelease>", keysym="n")
+    root.update()
+    # A timer is now pending (the debounce has not fired).
+    assert app._search_debounce_pending[0].get("after_id") is not None
+    app._global_disconnect()
+    root.update_idletasks()
+    # Destroying the root must succeed — no "can't delete Tcl command".
+    root.destroy()
+    # The interpreter is gone, so any further Tk call raises; that
+    # error itself proves the window was destroyed.
+    with pytest.raises(tk.TclError):
+        root.winfo_exists()
+
+
 def test_search_clear_button_still_filters_immediately(root, patched_clients):
     """The × clear button filters immediately, not via the debounce
     (v1.8.6): it is unaffected by the disconnect-timer tracking."""
@@ -1694,3 +1763,298 @@ def test_info_refresh_lists_all_naming_contexts(root, patched_clients):
     assert ("Naming contexts: DC=example,DC=local, "
             "CN=Configuration,DC=example,DC=local, "
             "CN=Schema,CN=Configuration,DC=example,DC=local") in text
+
+
+# -- v1.8.7: move AD object to another OU + AD context menu ------------------
+
+def _ad_rows_jdoe():
+    """Two user rows for the AD list (bypassing the server)."""
+    return [{"dn": "CN=jdoe,OU=Users,DC=example,DC=local", "name": "John Doe",
+             "type": "user", "description": "Analyst", "status": "Enabled"},
+            {"dn": "CN=asmith,OU=Users,DC=example,DC=local", "name": "Alice Smith",
+             "type": "user", "description": "Manager", "status": "Enabled"}]
+
+
+def test_move_button_enabled_only_with_selection(root, patched_clients):
+    """Move (and the other row actions) are disabled with no selection."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    _assert_ad_buttons_no_selection(app)
+    # A row in the list, selected: every AD button enables.
+    app._ad_rows = _ad_rows_jdoe()
+    app._ad_apply_filter()
+    root.update_idletasks()
+    app.ad_list.selection_set("CN=jdoe,OU=Users,DC=example,DC=local")
+    root.update()
+    _assert_ad_buttons_with_selection(app)
+    # Clearing the selection disables the row actions again.
+    app.ad_list.selection_remove(app.ad_list.selection())
+    root.update()
+    _assert_ad_buttons_no_selection(app)
+
+
+def test_move_dialog_shows_current_location_and_destination_picker(
+        root, monkeypatch):
+    """MoveObjectDialog shows the object's location and an OU picker."""
+    from msat.dialogs import MoveObjectDialog
+
+    monkeypatch.setattr("msat.dialogs.messagebox.showwarning",
+                        lambda *a, **k: None)
+
+    class _PickerClient:
+        """list_children returns containers for the domain and OU=Users."""
+        def list_children(self, dn):
+            if dn == "DC=example,DC=local":
+                return [
+                    {"dn": "OU=Users,DC=example,DC=local", "type": "ou"},
+                    {"dn": "OU=IT,DC=example,DC=local", "type": "ou"},
+                    {"dn": "CN=Builtin,DC=example,DC=local", "type": "container"},
+                    {"dn": "CN=jdoe,OU=Users,DC=example,DC=local", "type": "user"},
+                ]
+            if dn == "OU=Users,DC=example,DC=local":
+                return [
+                    {"dn": "OU=Sub,OU=Users,DC=example,DC=local", "type": "ou"},
+                ]
+            return []
+
+    dlg = MoveObjectDialog(
+        root, _PickerClient(), "DC=example,DC=local",
+        "CN=jdoe,OU=Users,DC=example,DC=local", "John Doe", "user",
+        "OU=Users,DC=example,DC=local")
+    root.update_idletasks()
+    try:
+        assert dlg.title() == "Move — John Doe"
+        assert dlg._object_label["text"] == "John Doe (user)"
+        assert dlg._current_label["text"] == "OU=Users,DC=example,DC=local"
+        # The picker lists containers only — the leaf user is not a destination.
+        assert dlg.tree.exists("OU=Users,DC=example,DC=local")
+        assert dlg.tree.exists("OU=IT,DC=example,DC=local")
+        assert dlg.tree.exists("CN=Builtin,DC=example,DC=local")
+        assert not dlg.tree.exists("CN=jdoe,OU=Users,DC=example,DC=local")
+        # The current parent is marked in the tree.
+        assert "(current location)" in dlg.tree.item(
+            "OU=Users,DC=example,DC=local", "text")
+        # Nothing selected yet: Move is disabled.
+        assert str(dlg._ok_button["state"]) == "disabled"
+        assert dlg.dest_label["text"] == "Destination: (none selected)"
+        # Expanding OU=Users loads its sub-OU (open top-down: the
+        # domain root first, then Users). A programmatic item(open=True)
+        # does not generate <<TreeviewOpen>> (only a triangle click
+        # does), so the handler is called directly, as the main tree
+        # tests do.
+        dlg.tree.item("DC=example,DC=local", open=True)
+        dlg.tree.item("OU=Users,DC=example,DC=local", open=True)
+        dlg._on_open(None)
+        root.update_idletasks()
+        assert dlg.tree.exists("OU=Sub,OU=Users,DC=example,DC=local")
+        # Picking another OU enables Move and shows the destination DN.
+        dlg.tree.selection_set("OU=IT,DC=example,DC=local")
+        root.update()
+        assert str(dlg._ok_button["state"]) == "normal"
+        assert dlg.dest_label["text"] == \
+            "Destination: OU=IT,DC=example,DC=local"
+        assert dlg.validate() is True
+        assert dlg.collect() == {
+            "destination_dn": "OU=IT,DC=example,DC=local"}
+        # Picking the current parent disables Move and says so.
+        dlg.tree.selection_set("OU=Users,DC=example,DC=local")
+        root.update()
+        assert str(dlg._ok_button["state"]) == "disabled"
+        assert "current location" in dlg.dest_label["text"]
+        assert dlg.validate() is False
+    finally:
+        dlg._on_cancel()
+
+
+def test_ad_move_refreshes_list_after_success(root, patched_clients, monkeypatch):
+    """A successful move refreshes the list (object gone from the old OU)."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    moved = {}
+    rows = _ad_rows_jdoe()
+
+    class _MoveAD(FakeADClient):
+        def list_children(self, dn):
+            return list(rows)
+
+        def move_object(self, dn, new_parent_dn):
+            moved["dn"] = dn
+            moved["dest"] = new_parent_dn
+            rows[:] = [r for r in rows if r["dn"] != dn]
+            return "{},{}".format("CN=jdoe", new_parent_dn)
+
+    app.ad_client = _MoveAD()
+    app._ad_current_dn = "OU=Users,DC=example,DC=local"
+    app._ad_rows = list(rows)
+    app._ad_apply_filter()
+    root.update_idletasks()
+
+    class _FakeMoveDialog:
+        def __init__(self, parent, client, domain_dn, object_dn, object_name,
+                     object_type, current_parent_dn):
+            self.result = {"destination_dn": "OU=IT,DC=example,DC=local"}
+
+        def wait_window(self):
+            return None
+
+    monkeypatch.setattr("msat.app.dialogs.MoveObjectDialog", _FakeMoveDialog)
+    app.ad_list.selection_set("CN=jdoe,OU=Users,DC=example,DC=local")
+    root.update()
+    app._ad_move()
+    root.update_idletasks()
+    assert moved == {"dn": "CN=jdoe,OU=Users,DC=example,DC=local",
+                     "dest": "OU=IT,DC=example,DC=local"}
+    assert "CN=jdoe,OU=Users,DC=example,DC=local" not in \
+        app.ad_list.get_children()
+    assert "CN=asmith,OU=Users,DC=example,DC=local" in \
+        app.ad_list.get_children()
+    assert "Moved John Doe to OU=IT,DC=example,DC=local." in \
+        app.statusbar["text"]
+
+
+def test_ad_move_failure_leaves_list_unchanged(root, patched_clients, monkeypatch):
+    """A failed move shows the error and leaves the list unchanged."""
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+
+    class _FailMoveAD(FakeADClient):
+        def move_object(self, dn, new_parent_dn):
+            raise Exception("Move failed: entry already exists")
+
+    app.ad_client = _FailMoveAD()
+    app._ad_current_dn = "OU=Users,DC=example,DC=local"
+    app._ad_rows = _ad_rows_jdoe()
+    app._ad_apply_filter()
+    root.update_idletasks()
+
+    class _FakeMoveDialog:
+        def __init__(self, *args):
+            self.result = {"destination_dn": "OU=IT,DC=example,DC=local"}
+
+        def wait_window(self):
+            return None
+
+    monkeypatch.setattr("msat.app.dialogs.MoveObjectDialog", _FakeMoveDialog)
+    app.ad_list.selection_set("CN=jdoe,OU=Users,DC=example,DC=local")
+    root.update()
+    app._ad_move()
+    root.update_idletasks()
+    assert shown, "expected an error dialog"
+    assert len(app.ad_list.get_children()) == 2
+    assert "CN=jdoe,OU=Users,DC=example,DC=local" in \
+        app.ad_list.get_children()
+
+
+def test_ad_move_rejects_containers(root, patched_clients, monkeypatch):
+    """Move refuses containers/OUs — leaf objects only."""
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showinfo",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    called = []
+
+    class _MoveAD(FakeADClient):
+        def move_object(self, dn, new_parent_dn):
+            called.append((dn, new_parent_dn))
+
+    app.ad_client = _MoveAD()
+    app._ad_current_dn = "DC=example,DC=local"
+    app._ad_rows = [{"dn": "OU=IT,DC=example,DC=local", "name": "IT",
+                     "type": "ou", "description": "", "status": ""}]
+    app._ad_apply_filter()
+    root.update_idletasks()
+    app.ad_list.selection_set("OU=IT,DC=example,DC=local")
+    root.update()
+    app._ad_move()
+    assert shown, "expected a 'Not applicable' info dialog"
+    assert called == [], "move_object must not be called for a container"
+
+
+# -- AD context menu (v1.8.7) --------------------------------------------------
+
+def test_ad_context_menu_contains_toolbar_actions(root, patched_clients):
+    """The context menu offers the toolbar actions, including Move."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    labels = [app._ad_context_menu.entrycget(i, "label")
+              for i in range(app._ad_context_menu.index("end") + 1)]
+    toolbar_labels = [btn["text"] for btn in app.ad_toolbar_buttons]
+    assert labels == toolbar_labels
+    assert "Move..." in labels
+
+
+def test_ad_context_menu_right_click_selects_row(root, patched_clients):
+    """Right-clicking a row selects it, then shows the menu."""
+    import types
+
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = _ad_rows_jdoe()
+    app._ad_apply_filter()
+    root.update()
+    posted = []
+    app._ad_context_menu.post = lambda x, y: posted.append((x, y))
+    dn = "CN=asmith,OU=Users,DC=example,DC=local"
+    bbox = app.ad_list.bbox(dn)
+    assert bbox, "row must be visible for a right-click"
+    event = types.SimpleNamespace(x=bbox[0] + 2, y=bbox[1] + 2,
+                                  x_root=100, y_root=200)
+    app._ad_on_list_right_click(event)
+    root.update_idletasks()
+    assert app.ad_list.selection() == (dn,)
+    assert posted == [(100, 200)]
+
+
+def test_ad_context_menu_state_matches_toolbar(root, patched_clients):
+    """Menu items mirror the toolbar buttons' state, with and without a selection."""
+    import types
+
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = _ad_rows_jdoe()
+    app._ad_apply_filter()
+    root.update()
+    app._ad_context_menu.post = lambda x, y: None
+
+    def _menu_states():
+        return {app._ad_context_menu.entrycget(i, "label"):
+                str(app._ad_context_menu.entrycget(i, "state"))
+                for i in range(app._ad_context_menu.index("end") + 1)}
+
+    def _toolbar_states():
+        return {btn["text"]: str(btn["state"])
+                for btn in app.ad_toolbar_buttons}
+
+    # No selection: right-click empty space; the row actions are
+    # disabled in both the menu and the toolbar.
+    event = types.SimpleNamespace(x=1, y=9999, x_root=100, y_root=200)
+    app._ad_on_list_right_click(event)
+    root.update_idletasks()
+    assert _menu_states() == _toolbar_states()
+    assert _menu_states()["Move..."] == "disabled"
+    assert _menu_states()["Delete"] == "disabled"
+    assert _menu_states()["Properties"] == "disabled"
+    assert _menu_states()["New User"] == "normal"
+    assert _menu_states()["Refresh"] == "normal"
+
+    # With a selection: right-click the row; everything is enabled.
+    dn = "CN=jdoe,OU=Users,DC=example,DC=local"
+    bbox = app.ad_list.bbox(dn)
+    assert bbox
+    event = types.SimpleNamespace(x=bbox[0] + 2, y=bbox[1] + 2,
+                                  x_root=100, y_root=200)
+    app._ad_on_list_right_click(event)
+    root.update_idletasks()
+    assert _menu_states() == _toolbar_states()
+    assert all(s == "normal" for s in _menu_states().values())

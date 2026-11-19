@@ -16,7 +16,7 @@ not assume it from the list.
 
 APP_NAME = "MSAT"
 APP_TITLE = "MSAT — macOS Server Administration Tools"
-APP_VERSION = "1.8.6"
+APP_VERSION = "1.8.7"
 
 # Placeholder domain. Set your own in Settings.
 DEFAULT_DOMAIN = "example.local"

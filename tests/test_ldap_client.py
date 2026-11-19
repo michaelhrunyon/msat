@@ -582,6 +582,71 @@ def test_delete_object(client):
     assert dn not in client.conn.strategy.entries
 
 
+# -- move object (v1.8.7) ------------------------------------------------------
+
+def test_first_rdn_and_parent_dn():
+    """DN parsing for a move: the first RDN verbatim, and the parent DN."""
+    from msat.ldap_client import _first_rdn, parent_dn
+    assert _first_rdn("CN=jdoe,OU=Users,DC=example,DC=local") == "CN=jdoe"
+    # An escaped comma is part of the RDN, not a separator.
+    assert _first_rdn("CN=Doe\\, John,OU=Users,DC=example,DC=local") == \
+        "CN=Doe\\, John"
+    # An escaped backslash before a comma: the comma IS a separator.
+    assert _first_rdn("CN=Foo\\\\,OU=Users,DC=example,DC=local") == \
+        "CN=Foo\\\\"
+    assert _first_rdn("CN=single") == "CN=single"
+    assert _first_rdn("") == ""
+    assert parent_dn("CN=jdoe,OU=Users,DC=example,DC=local") == \
+        "OU=Users,DC=example,DC=local"
+    assert parent_dn("CN=Doe\\, John,OU=Users,DC=example,DC=local") == \
+        "OU=Users,DC=example,DC=local"
+    assert parent_dn("DC=example,DC=local") == "DC=local"
+    assert parent_dn("CN=single") == ""
+    assert parent_dn("") == ""
+
+
+def test_move_object_moves_user_to_new_parent(client):
+    """move_object issues a ModifyDN with the same RDN and the new superior."""
+    old_dn = "CN=jdoe,OU=Users," + DOMAIN_DN
+    new_dn = client.move_object(old_dn, "OU=IT," + DOMAIN_DN)
+    assert new_dn == "CN=jdoe,OU=IT," + DOMAIN_DN
+    # The entry is at the new DN and gone from the old one.
+    assert client.get_object(new_dn)["sam"] == "jdoe"
+    with pytest.raises(ADError):
+        client.get_object(old_dn)
+
+
+def test_move_object_same_parent_is_rejected(client):
+    """Moving to the object's current parent is a no-op, rejected up front."""
+    dn = "CN=jdoe,OU=Users," + DOMAIN_DN
+    with pytest.raises(ADError, match="already in"):
+        client.move_object(dn, "OU=Users," + DOMAIN_DN)
+    # Case-insensitive: the same parent in different case is the same parent.
+    with pytest.raises(ADError, match="already in"):
+        client.move_object(dn, "ou=users,dc=example,dc=local")
+    # The entry is untouched.
+    assert client.get_object(dn)["sam"] == "jdoe"
+
+
+def test_move_object_missing_object_raises(client):
+    with pytest.raises(ADError):
+        client.move_object("CN=ghost,OU=Users," + DOMAIN_DN,
+                           "OU=IT," + DOMAIN_DN)
+
+
+def test_move_object_preserves_rdn_with_escaped_comma(client):
+    """A display name containing a comma keeps its escaped RDN on move."""
+    dn = "CN=Doe\\, John,OU=Users," + DOMAIN_DN
+    client.conn.strategy.add_entry(
+        dn, {"objectClass": ["top", "person", "organizationalUser", "user"],
+             "sAMAccountName": "doej", "name": "Doe, John"})
+    new_dn = client.move_object(dn, "OU=IT," + DOMAIN_DN)
+    assert new_dn == "CN=Doe\\, John,OU=IT," + DOMAIN_DN
+    assert client.get_object(new_dn)["sam"] == "doej"
+    with pytest.raises(ADError):
+        client.get_object(dn)
+
+
 def test_display_value_hex_for_binary():
     from msat.ldap_client import _display_value
     assert _display_value(bytes(range(16))) == (

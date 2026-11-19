@@ -53,6 +53,10 @@ class DialogBase(tk.Toplevel):
         ttk.Button(self._buttons, text="Cancel", command=self._on_cancel).pack(side=tk.RIGHT)
         ok = ttk.Button(self._buttons, text=self._ok_text, command=self._on_ok)
         ok.pack(side=tk.RIGHT, padx=(0, 6))
+        # Kept so a dialog can enable/disable its OK button (e.g.
+        # MoveObjectDialog disables Move until a valid destination is
+        # picked). Other dialogs never touch it.
+        self._ok_button = ok
         self.bind("<Return>", lambda _e: self._on_ok())
         self.bind("<Escape>", lambda _e: self._on_cancel())
         self.grab_set()
@@ -276,6 +280,171 @@ class AddToGroupDialog(DialogBase):
 
     def collect(self):
         return self._groups[self.listbox.curselection()[0]]
+
+
+# --------------------------------------------------------------------------
+# Move an AD object to another OU
+# --------------------------------------------------------------------------
+
+# Suffix marking a tree node's "Loading..." placeholder child (same
+# convention as the main window's AD tree: plain ASCII, because a null
+# byte in a Treeview iid is silently truncated by Tcl).
+_MOVE_LOADING_SUFFIX = "__loading__"
+
+
+def _move_dn_label(dn):
+    """'OU=IT,DC=example,DC=local' -> 'IT'; 'DC=example,DC=local' -> 'example'."""
+    if not dn:
+        return ""
+    first = dn.split(",", 1)[0]
+    if "=" in first:
+        return first.split("=", 1)[1].replace("\\,", ",")
+    return first
+
+
+class MoveObjectDialog(DialogBase):
+    """Move a leaf object (user, computer, group) to another OU.
+
+    Shows the object's current location (read-only) and a picker
+    tree of the OU/container hierarchy to choose the destination.
+    The tree lists containers only — never leaf objects — and loads
+    children lazily as nodes are expanded. The object's current
+    parent OU is marked as the current location; picking it disables
+    Move (a move to the same parent is a no-op). The full destination
+    DN is shown under the tree.
+    """
+
+    def __init__(self, parent, client, domain_dn, object_dn, object_name,
+                 object_type, current_parent_dn):
+        super().__init__(parent, "Move — {}".format(object_name),
+                         ok_text="Move")
+        self._client = client
+        self._domain_dn = domain_dn
+        self._current_parent_dn = current_parent_dn
+        self._selected_dn = None
+
+        info = ttk.Frame(self.body)
+        info.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(info, text="Object:").grid(row=0, column=0, sticky=tk.W)
+        # Kept as attributes so tests can assert the dialog shows the
+        # object's name/type and current location.
+        self._object_label = ttk.Label(
+            info, text="{} ({})".format(object_name, object_type))
+        self._object_label.grid(row=0, column=1, sticky=tk.W, padx=4)
+        ttk.Label(info, text="Current location:").grid(
+            row=1, column=0, sticky=tk.W)
+        self._current_label = ttk.Label(info, text=current_parent_dn)
+        self._current_label.grid(row=1, column=1, sticky=tk.W, padx=4)
+
+        ttk.Label(self.body, text="Destination OU:").pack(anchor=tk.W)
+        self.tree = ttk.Treeview(self.body, show="tree", height=12)
+        self.tree.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.tree.bind("<<TreeviewOpen>>", self._on_open)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.insert("", tk.END, iid=domain_dn,
+                         text=self._label_for(domain_dn))
+        self.tree.insert(domain_dn, tk.END,
+                         iid=domain_dn + _MOVE_LOADING_SUFFIX,
+                         text="Loading…")
+        self._populate(domain_dn)
+
+        self.dest_label = ttk.Label(self.body,
+                                    text="Destination: (none selected)")
+        self.dest_label.pack(anchor=tk.W, pady=(2, 0))
+        self._finish_buttons()
+        # Nothing is selected yet, so Move starts disabled; it is
+        # enabled by _update_destination once a valid destination is
+        # picked. Focus the tree so the user can browse immediately.
+        self._ok_button.config(state=tk.DISABLED)
+        self.tree.focus_set()
+
+    def _label_for(self, dn):
+        """Tree label for a container; the current parent is marked."""
+        label = _move_dn_label(dn)
+        if dn.lower() == self._current_parent_dn.lower():
+            label += "  (current location)"
+        return label
+
+    def _populate(self, parent_dn):
+        """Replace the 'Loading…' placeholder under parent_dn with its containers.
+
+        Only containers (OU / container / domain) are listed — the
+        destination must be a container, never a leaf object. On
+        failure the placeholder is restored so expanding again retries.
+        """
+        children = self.tree.get_children(parent_dn)
+        if not children or not children[0].endswith(_MOVE_LOADING_SUFFIX):
+            return
+        self.tree.delete(children[0])
+        try:
+            entries = self._client.list_children(parent_dn)
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            self.tree.insert(parent_dn, tk.END,
+                             iid=parent_dn + _MOVE_LOADING_SUFFIX,
+                             text="Loading…")
+            messagebox.showerror("Load failed", str(exc), parent=self)
+            return
+        for entry in entries:
+            if entry.get("type") not in ("ou", "container", "domain"):
+                continue
+            dn = entry["dn"]
+            self.tree.insert(parent_dn, tk.END, iid=dn,
+                             text=self._label_for(dn))
+            self.tree.insert(dn, tk.END, iid=dn + _MOVE_LOADING_SUFFIX,
+                             text="Loading…")
+
+    def _on_open(self, _event):
+        """Populate every open node still showing a placeholder.
+
+        <<TreeviewOpen>> does not reliably say which node was just
+        opened, so scan the whole tree (containers only, so it is
+        small) and populate any open node that still has one.
+        """
+        def walk(node):
+            self._populate(node)
+            for child in self.tree.get_children(node):
+                if self.tree.item(child, "open"):
+                    walk(child)
+
+        walk("")
+
+    def _on_select(self, _event):
+        sel = self.tree.selection()
+        self._selected_dn = sel[0] if sel else None
+        self._update_destination()
+
+    def _update_destination(self):
+        """Show the selected destination DN and enable/disable Move."""
+        dn = self._selected_dn
+        if not dn:
+            self.dest_label.config(text="Destination: (none selected)")
+            self._ok_button.config(state=tk.DISABLED)
+            return
+        if dn.lower() == self._current_parent_dn.lower():
+            self.dest_label.config(
+                text="Destination: {} (current location — pick a "
+                     "different OU)".format(dn))
+            self._ok_button.config(state=tk.DISABLED)
+        else:
+            self.dest_label.config(text="Destination: {}".format(dn))
+            self._ok_button.config(state=tk.NORMAL)
+
+    def validate(self):
+        if not self._selected_dn:
+            messagebox.showwarning("No destination selected",
+                                   "Select a destination OU first.",
+                                   parent=self)
+            return False
+        if self._selected_dn.lower() == self._current_parent_dn.lower():
+            messagebox.showwarning(
+                "Same location",
+                "The object is already in this OU. Pick a different "
+                "destination.", parent=self)
+            return False
+        return True
+
+    def collect(self):
+        return {"destination_dn": self._selected_dn}
 
 
 # --------------------------------------------------------------------------

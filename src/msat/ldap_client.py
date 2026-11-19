@@ -128,6 +128,47 @@ def _to_int(value, default=0):
         return default
 
 
+def _first_rdn(dn):
+    """First RDN component of a DN, verbatim.
+
+    'CN=Doe\\, John,OU=Users,DC=...' -> 'CN=Doe\\, John'. The split
+    is at the first comma not escaped by a backslash — a comma counts
+    as escaped when preceded by an odd run of backslashes, since
+    '\\\\' is itself an escaped backslash. The RDN is returned
+    exactly as it appears in the DN (no re-escaping), which is what
+    modify_dn needs for a pure move: same RDN, new parent.
+    """
+    if not dn:
+        return ""
+    backslashes = 0
+    for i, ch in enumerate(dn):
+        if ch == "\\":
+            backslashes += 1
+        elif ch == ",":
+            if backslashes % 2 == 0:
+                return dn[:i]
+            backslashes = 0
+        else:
+            backslashes = 0
+    return dn
+
+
+def parent_dn(dn):
+    """DN of the parent container: the DN minus its first RDN.
+
+    'CN=jdoe,OU=Users,DC=example,DC=local' ->
+    'OU=Users,DC=example,DC=local'. A DN with no parent (a bare
+    RDN) gives ''.
+    """
+    if not dn:
+        return ""
+    rdn = _first_rdn(dn)
+    rest = dn[len(rdn):]
+    if rest.startswith(","):
+        return rest[1:]
+    return ""
+
+
 def _rdn_value(dn):
     """First RDN value of a DN ('OU=IT,DC=...' -> 'IT')."""
     if not dn:
@@ -807,6 +848,30 @@ class ADClient:
         if not ok:
             raise ADError("Delete {} failed: {}".format(
                 dn, self.conn.result.get("description", "unknown error")))
+
+    def move_object(self, dn, new_parent_dn):
+        """Move a leaf object to another OU/container (same RDN, no rename).
+
+        Uses ModifyDN with the object's current RDN and the new
+        superior, so the name is unchanged — only the parent changes.
+        Moving to the object's current parent is rejected up front:
+        real AD would treat it as a successful no-op, and the ldap3
+        mock loses the entry on a same-parent ModifyDN, so never
+        issue one. Returns the object's new DN.
+        """
+        self._require_connection()
+        new_parent_dn = (new_parent_dn or "").strip()
+        if parent_dn(dn).lower() == new_parent_dn.lower():
+            raise ADError("{} is already in {}.".format(dn, new_parent_dn))
+        rdn = _first_rdn(dn)
+        try:
+            ok = self.conn.modify_dn(dn, rdn, new_superior=new_parent_dn)
+        except LDAPException as exc:
+            raise ADError("Move {} failed: {}".format(dn, exc)) from exc
+        if not ok:
+            raise ADError("Move {} failed: {}".format(
+                dn, self.conn.result.get("description", "unknown error")))
+        return "{},{}".format(rdn, new_parent_dn)
 
     # -- sites, subnets, trusts (read-only directory info) ----------------
 

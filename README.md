@@ -76,11 +76,19 @@ the Group Policy Management Console on a domain controller.
   **Members** tab (Add / Remove, applied immediately); the `member`
   attribute is read-only in the Attribute Editor.
 - **AD actions:** New User / Computer / Group, Enable / Disable,
-  Unlock, Reset Password, Add to Group, Delete (with confirmation).
+  Unlock, Reset Password, Add to Group, **Move…**, Delete (with
+  confirmation). Move relocates a user, computer or group to
+  another OU (same name, new parent — no rename, and containers
+  themselves cannot be moved); pick the destination OU in the
+  picker, which marks the current parent so it cannot be chosen.
   Creating a user is atomic: if setting the password fails (for
   example the password does not meet the complexity policy), the
   half-created account is removed again, so you can fix the
   password and retry instead of hitting "object already exists".
+  Right-clicking an object in the AD list shows a context menu
+  with the same actions as the toolbar (including Move…), and
+  right-clicking a row selects it first; menu items are
+  enabled/disabled to match the toolbar buttons.
 - **DHCP:** scopes with leases and reservations, superscopes.
   Reservations can be added and edited in place (IP, name,
   description); changing the MAC recreates the reservation
@@ -292,7 +300,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.6** — tested against a live Active Directory environment (3 DCs). 224 tests passing.
+**v1.8.7** — tested against a live Active Directory environment (3 DCs). 238 tests passing.
 
 ## Known limitations
 

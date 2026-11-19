@@ -26,7 +26,7 @@ from .constants import (APP_TITLE, APP_VERSION, DEFAULT_LDAPS_PORT,
 from .credentials import CredentialStore
 from .dhcp import DHCPManager
 from .dns import DNSManager
-from .ldap_client import ADClient, ADInvalidCredentialsError
+from .ldap_client import ADClient, ADInvalidCredentialsError, parent_dn
 from .settings import load_settings, save_settings
 from .winrm_client import WinRMClient, detect_server_roles
 
@@ -50,7 +50,7 @@ class MSATApp:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        # Wide enough for the AD tab toolbar (10 buttons) to fit
+        # Wide enough for the AD tab toolbar (12 buttons) to fit
         # without clipping; the minimum keeps it from being shrunk
         # below the toolbar width.
         root.geometry("1280x800")
@@ -121,8 +121,23 @@ class MSATApp:
         # Deferred update check: the main window appears first, then
         # the check runs synchronously (5-second timeout). It is
         # silent unless a newer release is actually found — see
-        # _check_for_updates.
-        self.root.after(2000, self._startup_update_check)
+        # _check_for_updates. The timer id is kept so the check can
+        # be cancelled: once any check runs, and when the window is
+        # destroyed, a pending startup check must not fire later
+        # (notably while an update dialog is already open).
+        self._startup_check_after_id = self.root.after(
+            2000, self._startup_update_check)
+
+    def _cancel_startup_check(self):
+        """Cancel the pending deferred update check, if any."""
+        after_id = getattr(self, "_startup_check_after_id", None)
+        if after_id is None:
+            return
+        self._startup_check_after_id = None
+        try:
+            self.root.after_cancel(after_id)
+        except tk.TclError:
+            pass  # Already fired, or the interpreter is going away.
 
     # -- menu bar / updates --------------------------------------------------
 
@@ -137,7 +152,20 @@ class MSATApp:
 
     def _startup_update_check(self):
         """Automatic check shortly after launch (silent unless an
-        update is found)."""
+        update is found).
+
+        A deferred timer can outlive its window (the timer is not
+        reliably cancelled when the root is destroyed outright), so
+        a stale timer firing after its window is gone must do
+        nothing — it must never open an update dialog for an app
+        that no longer exists.
+        """
+        try:
+            alive = self.root.winfo_exists()
+        except tk.TclError:
+            return  # Interpreter already gone.
+        if not alive:
+            return
         self._check_for_updates(manual=False)
 
     def _manual_update_check(self):
@@ -154,6 +182,10 @@ class MSATApp:
         used — the check is one short synchronous request on the UI
         thread.
         """
+        # Any check (manual or automatic) supersedes the pending
+        # deferred startup check, so it cannot fire later while an
+        # update dialog is already open.
+        self._cancel_startup_check()
         release = updater.get_latest_release()
         if release is None:
             if manual:
@@ -437,11 +469,15 @@ class MSATApp:
         # after_cancel on an already-fired timer raises TclError, so
         # guard it — the debounced wrapper clears the stored ID when
         # it fires, so this is only a belt-and-braces guard.
+        # Cancel with the widget that scheduled the timer (stored in
+        # the pending dict): cancelling via the root corrupts Tcl's
+        # callback bookkeeping and a later root.destroy() fails.
         for pending in self._search_debounce_pending:
             after_id = pending.get("after_id")
             if after_id is not None:
+                widget = pending.get("widget") or self.root
                 try:
-                    self.root.after_cancel(after_id)
+                    widget.after_cancel(after_id)
                 except tk.TclError:
                     pass
                 pending["after_id"] = None
@@ -496,6 +532,9 @@ class MSATApp:
         # state: a tab whose role is missing stays gated even though
         # the app is connected.
         self._apply_role_gating()
+        # The AD buttons that act on a selected row follow the
+        # selection as well as the connection (below).
+        self._ad_update_action_buttons()
 
     # -- role detection and tab gating ------------------------------------
 
@@ -728,6 +767,7 @@ class MSATApp:
         messagebox.showerror(title, message, parent=self.root)
 
     def _on_close(self):
+        self._cancel_startup_check()
         if self.ad_client is not None:
             self.ad_client.disconnect()
         self.creds.clear()
@@ -768,7 +808,14 @@ class MSATApp:
         # after the last keystroke before filtering; a new keystroke
         # cancels the pending filter. The clear (×) button below still
         # filters immediately — clearing is a deliberate action.
-        _pending = {"after_id": None}
+        # The widget that scheduled the timer is stored with the ID:
+        # a timer MUST be cancelled with the same widget that
+        # scheduled it — cancelling an entry-scheduled timer via
+        # root.after_cancel corrupts Tcl's callback bookkeeping and
+        # a later root.destroy() fails with "can't delete Tcl
+        # command", leaving the window (and its pending startup
+        # update check) alive.
+        _pending = {"after_id": None, "widget": entry}
         self._search_debounce_pending.append(_pending)
 
         def _on_debounced():
@@ -825,23 +872,43 @@ class MSATApp:
     def _build_ad_tab(self):
         toolbar = ttk.Frame(self.ad_tab)
         toolbar.pack(fill=tk.X, pady=(0, 4))
+        # (label, handler, needs_selection). The "needs selection"
+        # buttons act on the selected list row; the others work on
+        # the current container (New…) or need nothing (Refresh).
+        # The right-click context menu below is built from this same
+        # list, so the two can never drift apart.
+        ad_actions = [
+            ("New User", self._ad_new_user, False),
+            ("New Computer", self._ad_new_computer, False),
+            ("New Group", self._ad_new_group, False),
+            ("Enable", self._ad_enable, True),
+            ("Disable", self._ad_disable, True),
+            ("Unlock", self._ad_unlock, True),
+            ("Reset Password", self._ad_reset_password, True),
+            ("Add to Group", self._ad_add_to_group, True),
+            ("Move...", self._ad_move, True),
+            ("Properties", self._ad_properties, True),
+            ("Delete", self._ad_delete, True),
+            ("Refresh", self._ad_refresh, False),
+        ]
         self.ad_toolbar_buttons = []
-        for text, command in (
-                ("New User", self._ad_new_user),
-                ("New Computer", self._ad_new_computer),
-                ("New Group", self._ad_new_group),
-                ("Enable", self._ad_enable),
-                ("Disable", self._ad_disable),
-                ("Unlock", self._ad_unlock),
-                ("Reset Password", self._ad_reset_password),
-                ("Add to Group", self._ad_add_to_group),
-                ("Properties", self._ad_properties),
-                ("Delete", self._ad_delete),
-                ("Refresh", self._ad_refresh)):
+        self._ad_selection_buttons = []
+        for text, command, needs_selection in ad_actions:
             btn = ttk.Button(toolbar, text=text, command=command,
                              state=tk.DISABLED)
             btn.pack(side=tk.LEFT, padx=2)
             self.ad_toolbar_buttons.append(btn)
+            if needs_selection:
+                self._ad_selection_buttons.append(btn)
+        # Right-click context menu on the object list: the same
+        # actions as the toolbar, in the same order, each calling the
+        # exact same handler as its toolbar button — no duplicated
+        # logic. Its items mirror the toolbar buttons' states (see
+        # _ad_on_list_right_click), so the menu is context-sensitive
+        # the same way the toolbar is.
+        self._ad_context_menu = tk.Menu(self.root, tearoff=0)
+        for text, command, _needs in ad_actions:
+            self._ad_context_menu.add_command(label=text, command=command)
 
         paned = ttk.PanedWindow(self.ad_tab, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -875,6 +942,13 @@ class MSATApp:
         self.ad_list.column("Locked", width=60)
         self.ad_list.pack(fill=tk.BOTH, expand=True)
         self.ad_list.bind("<Double-Button-1>", self._ad_on_list_double_click)
+        # Selection changes gate the buttons that act on a row (below).
+        self.ad_list.bind("<<TreeviewSelect>>",
+                          lambda _e: self._ad_update_action_buttons())
+        # Right-click (Button-3) or Control-click (the macOS
+        # right-click) opens the context menu.
+        self.ad_list.bind("<Button-3>", self._ad_on_list_right_click)
+        self.ad_list.bind("<Control-Button-1>", self._ad_on_list_right_click)
         paned.add(list_frame, weight=2)
 
         self._ad_current_dn = None
@@ -1048,6 +1122,49 @@ class MSATApp:
                                         child["description"], child["status"],
                                         locked)))
         self._refill_filtered(self.ad_list, rows, self._ad_search_var.get())
+        # Refilling drops the selection, so the row-dependent buttons
+        # must follow (below).
+        self._ad_update_action_buttons()
+
+    def _ad_update_action_buttons(self):
+        """Enable/disable the AD buttons that need a list selection.
+
+        New User / Computer / Group work on the current container and
+        Refresh needs nothing, so they follow the plain connected
+        state (set by _set_connected). Enable / Disable / Unlock /
+        Reset Password / Add to Group / Move / Properties / Delete
+        act on the selected list row, so they are disabled when
+        nothing is selected — the same rule the context menu mirrors.
+        Called on list selection changes, after the list is refilled,
+        and from _set_connected.
+        """
+        connected = self.ad_client is not None
+        has_selection = bool(self.ad_list.selection())
+        state = tk.NORMAL if (connected and has_selection) else tk.DISABLED
+        for btn in self._ad_selection_buttons:
+            btn.config(state=state)
+
+    def _ad_on_list_right_click(self, event):
+        """Right-click (Button-3) or Control-click on the object list.
+
+        Selects the row under the cursor first (standard behaviour),
+        then shows the context menu. Right-clicking empty space
+        clears the selection, so only the actions that need no
+        selection are offered. Each menu item mirrors its toolbar
+        button's state, so the menu is context-sensitive the same
+        way the toolbar is.
+        """
+        row = self.ad_list.identify_row(event.y)
+        if row:
+            self.ad_list.selection_set(row)
+            self.ad_list.focus(row)
+        else:
+            self.ad_list.selection_remove(self.ad_list.selection())
+        self._ad_update_action_buttons()
+        for index, btn in enumerate(self.ad_toolbar_buttons):
+            self._ad_context_menu.entryconfig(index, state=btn["state"])
+        self._ad_context_menu.post(event.x_root, event.y_root)
+        return "break"
 
     def _ad_on_list_double_click(self, _event):
         sel = self.ad_list.selection()
@@ -1252,6 +1369,44 @@ class MSATApp:
             self._error(exc)
             return
         self.set_status("Added {} to group {}.".format(name, group["name"]))
+
+    def _ad_move(self):
+        """Move the selected leaf object to another OU.
+
+        Only users, computers and groups can be moved — moving a
+        container or OU (a whole subtree) is out of scope. The
+        destination is picked in a dialog that browses the
+        OU/container hierarchy; the object's current parent cannot
+        be picked (a move to the same parent is a no-op). After a
+        successful move the list is refreshed — the object is gone
+        from the old OU.
+        """
+        sel = self._ad_selected()
+        if not sel:
+            return
+        dn, name, obj_type = sel
+        if obj_type not in ("user", "computer", "group"):
+            messagebox.showinfo(
+                "Not applicable",
+                "Only users, computers and groups can be moved. "
+                "Containers and OUs cannot be moved.",
+                parent=self.root)
+            return
+        base_dn = self.ad_client.get_default_naming_context()
+        dlg = dialogs.MoveObjectDialog(
+            self.root, self.ad_client, base_dn, dn, name, obj_type,
+            parent_dn(dn))
+        dlg.wait_window()
+        if not dlg.result:
+            return
+        dest_dn = dlg.result["destination_dn"]
+        try:
+            self.ad_client.move_object(dn, dest_dn)
+        except Exception as exc:  # noqa: BLE001
+            self._error(exc)
+            return
+        self._ad_refresh()
+        self.set_status("Moved {} to {}.".format(name, dest_dn))
 
     def _ad_properties(self):
         """Open the Properties dialog for the selected user or group."""

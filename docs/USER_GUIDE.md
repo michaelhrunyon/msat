@@ -192,6 +192,23 @@ folder and outside the app bundle.
   at next logon.
 - **Add to Group:** select a user or computer, search for a group by
   name, pick it, and the object is added as a member.
+- **Move…:** select a user, computer or group, click **Move…**, and
+  pick the destination OU in the picker — expand the OU tree to
+  browse to it; the full destination DN is shown under the tree.
+  The object keeps its name and moves to the new parent OU (a pure
+  move — no rename). The current parent OU is marked "(current
+  location)" in the picker and cannot be chosen, so a no-op move
+  is impossible. Containers/OUs themselves cannot be moved, only
+  leaf objects. After a successful move the list refreshes (the
+  object is gone from the old OU) and the status bar confirms it.
+- **Right-click menu:** right-clicking a row in the AD objects list
+  selects that row and shows a context menu with the same actions
+  as the toolbar — New User / Computer / Group, Enable / Disable,
+  Unlock, Reset Password, Add to Group, Move…, Properties, Delete,
+  Refresh — calling the exact same actions. Each menu item is
+  enabled or disabled to match its toolbar button for the current
+  selection (for example Move… is disabled with nothing selected).
+  On macOS, Control-click works the same as a right-click.
 - **Delete:** asks for confirmation first. This cannot be undone.
 - **Refresh:** reloads the current OU.
 
