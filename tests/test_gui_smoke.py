@@ -1867,6 +1867,64 @@ def test_move_dialog_shows_current_location_and_destination_picker(
         dlg._on_cancel()
 
 
+def test_move_dialog_open_deferred_populates_expanded_ou(root, monkeypatch):
+    """The Move dialog's open handler defers to idle (v1.8.8 regression).
+
+    Regression test (v1.8.8): the dialog copied the old v1.4 synchronous
+    pattern — _on_open scanned the tree from <<TreeviewOpen>> directly,
+    which can fire before the clicked node's open state settles, so the
+    just-expanded OU read as closed, was skipped, and its "Loading…"
+    placeholder stuck forever. The handler now defers the scan with
+    after_idle, mirroring the main tree's v1.5 fix, so by the time it
+    runs the open state has settled.
+    """
+    from msat.dialogs import MoveObjectDialog, _MOVE_LOADING_SUFFIX
+
+    monkeypatch.setattr("msat.dialogs.messagebox.showwarning",
+                        lambda *a, **k: None)
+
+    class _PickerClient:
+        def list_children(self, dn):
+            if dn == "DC=example,DC=local":
+                return [
+                    {"dn": "OU=Users,DC=example,DC=local", "type": "ou"},
+                ]
+            if dn == "OU=Users,DC=example,DC=local":
+                return [
+                    {"dn": "OU=Sub,OU=Users,DC=example,DC=local",
+                     "type": "ou"},
+                ]
+            return []
+
+    dlg = MoveObjectDialog(
+        root, _PickerClient(), "DC=example,DC=local",
+        "CN=jdoe,OU=Users,DC=example,DC=local", "John Doe", "user",
+        "OU=Users,DC=example,DC=local")
+    root.update_idletasks()
+    try:
+        users_dn = "OU=Users,DC=example,DC=local"
+        sub_dn = "OU=Sub,OU=Users,DC=example,DC=local"
+        # The domain is already expanded (that is how Users is visible);
+        # Users itself still shows its placeholder and is not yet open.
+        dlg.tree.item("DC=example,DC=local", open=True)
+        assert dlg.tree.exists(users_dn)
+        assert dlg.tree.get_children(users_dn) == \
+            (users_dn + _MOVE_LOADING_SUFFIX,)
+        assert not dlg.tree.exists(sub_dn)
+
+        # Simulate <<TreeviewOpen>> firing BEFORE the open state settles:
+        # the handler runs, then the state settles, then idle callbacks run.
+        dlg._on_open(None)
+        dlg.tree.item(users_dn, open=True)
+        root.update_idletasks()
+
+        users_children = dlg.tree.get_children(users_dn)
+        assert users_dn + _MOVE_LOADING_SUFFIX not in users_children
+        assert sub_dn in users_children
+    finally:
+        dlg._on_cancel()
+
+
 def test_ad_move_refreshes_list_after_success(root, patched_clients, monkeypatch):
     """A successful move refreshes the list (object gone from the old OU)."""
     app = MSATApp(root)

@@ -300,7 +300,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.7** — tested against a live Active Directory environment (3 DCs). 238 tests passing.
+**v1.8.8** — tested against a live Active Directory environment (3 DCs). 239 tests passing.
 
 ## Known limitations
 

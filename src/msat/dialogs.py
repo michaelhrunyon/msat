@@ -394,6 +394,20 @@ class MoveObjectDialog(DialogBase):
                              text="Loading…")
 
     def _on_open(self, _event):
+        # Defer the scan until idle: <<TreeviewOpen>> can fire before
+        # the clicked node's open state has settled, so reading
+        # item(node, "open") synchronously can see False for the node
+        # that was just expanded and skip it, leaving its "Loading…"
+        # placeholder stuck. By idle time the state has settled
+        # either way. This is the same pattern as the main AD tree
+        # (_ad_on_tree_open / _ad_populate_open_placeholders), which
+        # had the identical bug in v1.4 and was fixed in v1.5. The
+        # callback is scheduled on the dialog itself, so closing the
+        # dialog before idle runs cancels it — nothing populates a
+        # destroyed tree.
+        self.after_idle(self._populate_open_placeholders)
+
+    def _populate_open_placeholders(self):
         """Populate every open node still showing a placeholder.
 
         <<TreeviewOpen>> does not reliably say which node was just

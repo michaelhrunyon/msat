@@ -195,6 +195,8 @@ folder and outside the app bundle.
 - **Move…:** select a user, computer or group, click **Move…**, and
   pick the destination OU in the picker — expand the OU tree to
   browse to it; the full destination DN is shown under the tree.
+  Expanding an OU loads its sub-OUs (fixed in v1.8.8: expanding an
+  OU could previously leave it stuck on "Loading…").
   The object keeps its name and moves to the new parent OU (a pure
   move — no rename). The current parent OU is marked "(current
   location)" in the picker and cannot be chosen, so a no-op move
