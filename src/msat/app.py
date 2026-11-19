@@ -88,6 +88,11 @@ class MSATApp:
         self._search_entries = []
         self._search_vars = []
         self._search_clear_btns = []
+        # Pending debounce timers, one per search row (see
+        # _make_search_row): each entry is the row's {"after_id": ...}
+        # dict. _global_disconnect cancels them so a filter cannot
+        # fire after the trees have been cleared.
+        self._search_debounce_pending = []
 
         self._build_global_bar()
 
@@ -425,6 +430,21 @@ class MSATApp:
         self._clear_tree(self.ad_list)
         self._ad_current_dn = None
         self._ad_rows = []
+        # Cancel any pending search-debounce timers before clearing
+        # the search text: a keystroke made just before Disconnect
+        # schedules a filter 150 ms out, and without cancelling it
+        # the filter would fire after the trees have been cleared.
+        # after_cancel on an already-fired timer raises TclError, so
+        # guard it — the debounced wrapper clears the stored ID when
+        # it fires, so this is only a belt-and-braces guard.
+        for pending in self._search_debounce_pending:
+            after_id = pending.get("after_id")
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                pending["after_id"] = None
         for var in self._search_vars:
             var.set("")
         for tree in (self.dhcp_scopes, self.dhcp_leases, self.dhcp_reservations):
@@ -749,11 +769,20 @@ class MSATApp:
         # cancels the pending filter. The clear (×) button below still
         # filters immediately — clearing is a deliberate action.
         _pending = {"after_id": None}
+        self._search_debounce_pending.append(_pending)
+
+        def _on_debounced():
+            # The timer has fired: forget its ID (so disconnect does
+            # not try to cancel an already-fired timer) and run the
+            # filter.
+            _pending["after_id"] = None
+            on_change()
 
         def _on_key_release(_event):
             if _pending["after_id"] is not None:
                 entry.after_cancel(_pending["after_id"])
-            _pending["after_id"] = entry.after(150, on_change)
+                _pending["after_id"] = None
+            _pending["after_id"] = entry.after(150, _on_debounced)
 
         entry.bind("<KeyRelease>", _on_key_release)
         # A small clear (×) button beside the entry: empties the

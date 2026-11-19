@@ -694,11 +694,28 @@ class ADClient:
         self._add(dn, ["top", "person", "organizationalUser", "user"],
                   attrs, "Create user {}".format(sam_account_name))
         if password:
-            self.set_password(dn, password)
-            self.set_user_account_control(dn, user_account_control)
-            if must_change:
-                self._modify(dn, {"pwdLastSet": [(MODIFY_REPLACE, [0])]},
-                             "Set 'must change password' for {}".format(dn))
+            try:
+                self.set_password(dn, password)
+                self.set_user_account_control(dn, user_account_control)
+                if must_change:
+                    self._modify(dn, {"pwdLastSet": [(MODIFY_REPLACE, [0])]},
+                                 "Set 'must change password' for {}".format(dn))
+            except Exception as exc:
+                # The add already succeeded, so a failed post-add step
+                # (e.g. a password rejected by complexity policy)
+                # would leave a disabled orphan behind — and a retry
+                # would then fail with "object already exists". Roll
+                # back by deleting the new object, then re-raise the
+                # original error. If the delete itself fails, say so
+                # in the error, so the admin knows an orphan may exist.
+                try:
+                    self.delete_object(dn)
+                except ADError as cleanup_exc:
+                    raise ADError(
+                        "{}; rollback also failed ({}), so a disabled "
+                        "user object may remain in AD".format(
+                            exc, cleanup_exc)) from exc
+                raise
         return dn
 
     def create_computer(self, ou_dn, name, description=""):

@@ -9,7 +9,7 @@ import pytest
 from ldap3 import ALL, Connection, MOCK_SYNC, Server
 
 from msat.ldap_client import (
-    ADClient, ADConnectionError, encode_password, is_locked_out,
+    ADClient, ADConnectionError, ADError, encode_password, is_locked_out,
 )
 
 DOMAIN_DN = "DC=example,DC=local"
@@ -350,6 +350,71 @@ def test_create_user_with_must_change_sets_pwd_last_set(client):
     assert entry["unicodePwd"] == [encode_password("Temp1234!")]
     assert _stored_values(entry, "pwdLastSet") == ["0"]
     assert client.get_object(dn)["uac"] == 512
+
+
+def test_create_user_rolls_back_when_password_fails(client, monkeypatch):
+    """A post-add password failure deletes the new user object instead
+    of leaving a disabled orphan (v1.8.6), so a retry does not fail
+    with "object already exists"."""
+    def _failing_password(self, dn, new_password):
+        raise ADError("Reset password for {} failed: password does not "
+                      "meet complexity requirements".format(dn))
+
+    monkeypatch.setattr(ADClient, "set_password", _failing_password)
+    dn = "CN=rollback1,OU=Users," + DOMAIN_DN
+    with pytest.raises(ADError, match="complexity"):
+        client.create_user("OU=Users," + DOMAIN_DN, "rollback1",
+                           given_name="Roll", sn="Back", password="weak")
+    assert dn not in client.conn.strategy.entries
+
+
+def test_create_user_rolls_back_when_enable_fails(client, monkeypatch):
+    """A failure in a later post-add step (enable) also rolls back
+    (v1.8.6), even though the password was already written."""
+    def _failing_uac(self, dn, uac):
+        raise ADError("Set userAccountControl on {} failed".format(dn))
+
+    monkeypatch.setattr(ADClient, "set_user_account_control", _failing_uac)
+    dn = "CN=rollback3,OU=Users," + DOMAIN_DN
+    with pytest.raises(ADError, match="userAccountControl"):
+        client.create_user("OU=Users," + DOMAIN_DN, "rollback3",
+                           given_name="Roll", sn="Back", password="Temp1234!")
+    assert dn not in client.conn.strategy.entries
+
+
+def test_create_user_rollback_failure_is_reported(client, monkeypatch):
+    """If the rollback delete itself fails, the error says so (v1.8.6),
+    so the admin knows a disabled orphan may exist."""
+    def _failing_password(self, dn, new_password):
+        raise ADError("Reset password for {} failed: complexity".format(dn))
+
+    def _failing_delete(self, dn):
+        raise ADError("Delete {} failed: access denied".format(dn))
+
+    monkeypatch.setattr(ADClient, "set_password", _failing_password)
+    monkeypatch.setattr(ADClient, "delete_object", _failing_delete)
+    dn = "CN=rollback2,OU=Users," + DOMAIN_DN
+    with pytest.raises(ADError) as excinfo:
+        client.create_user("OU=Users," + DOMAIN_DN, "rollback2",
+                           given_name="Roll", sn="Back", password="weak")
+    assert "rollback also failed" in str(excinfo.value)
+    assert "may remain in AD" in str(excinfo.value)
+    # The orphan is still there — the delete failed.
+    assert dn in client.conn.strategy.entries
+
+
+def test_create_user_success_is_unaffected_by_rollback(client):
+    """A successful create is unaffected by the rollback path (v1.8.6):
+    all three post-add steps run and the object remains."""
+    dn = client.create_user("OU=Users," + DOMAIN_DN, "okuser",
+                            given_name="Ok", sn="User",
+                            display_name="Ok User", password="Temp1234!",
+                            must_change=True)
+    assert client.get_object(dn)["uac"] == 512
+    assert dn in client.conn.strategy.entries
+    entry = client.conn.strategy.entries[dn]
+    assert entry["unicodePwd"] == [encode_password("Temp1234!")]
+    assert _stored_values(entry, "pwdLastSet") == ["0"]
 
 
 def test_search_uses_paged_search_for_real_connections():

@@ -67,7 +67,8 @@ button, where a failure does show the error.
 
 Click **Disconnect** when you are done — it disconnects everything,
 wipes the stored credentials, and clears the password field, so
-nothing is left sitting in the connection bar. Closing the app
+nothing is left sitting in the connection bar. It also cancels any
+search filter still waiting to run. Closing the app
 wipes them too.
 
 If a connection fails, the app shows the error (wrong password, server
@@ -177,6 +178,10 @@ folder and outside the app bundle.
 - **New User:** fills in the OU you have selected. The account is
   created disabled, the password is set, then it is enabled. Tick
   "User must change password at next logon" to force a change.
+  Creating a user is atomic: if setting the password fails (for
+  example the password does not meet the complexity policy), the
+  half-created account is removed again, so you can fix the
+  password and retry instead of hitting "object already exists".
 - **New Computer:** creates the computer account (sAMAccountName is
   the name with a trailing `$`).
 - **New Group:** pick the group type (Global security is the usual

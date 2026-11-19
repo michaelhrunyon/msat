@@ -31,7 +31,8 @@ the Group Policy Management Console on a domain controller.
   gray and Disconnect is blue instead, so the blue button always
   shows the current state. If the connection fails, both return
   to gray. Disconnect also clears the password field, so the
-  password is not left sitting in the UI after you disconnect.
+  password is not left sitting in the UI after you disconnect,
+  and cancels any search filter still waiting to run.
 - **Credential validation up front.** Connect gates on the LDAP bind
   and a small validation search before anything is marked connected.
   If the username or password is wrong, the app stays disconnected
@@ -76,6 +77,10 @@ the Group Policy Management Console on a domain controller.
   attribute is read-only in the Attribute Editor.
 - **AD actions:** New User / Computer / Group, Enable / Disable,
   Unlock, Reset Password, Add to Group, Delete (with confirmation).
+  Creating a user is atomic: if setting the password fails (for
+  example the password does not meet the complexity policy), the
+  half-created account is removed again, so you can fix the
+  password and retry instead of hitting "object already exists".
 - **DHCP:** scopes with leases and reservations, superscopes.
   Reservations can be added and edited in place (IP, name,
   description); changing the MAC recreates the reservation
@@ -287,7 +292,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.5** — tested against a live Active Directory environment (3 DCs). 218 tests passing.
+**v1.8.6** — tested against a live Active Directory environment (3 DCs). 224 tests passing.
 
 ## Known limitations
 

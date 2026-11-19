@@ -1532,6 +1532,76 @@ def test_search_filter_is_debounced(root, patched_clients):
     assert len(app.ad_list.get_children()) == 1
 
 
+def test_disconnect_cancels_pending_search_debounce(root, patched_clients,
+                                                    monkeypatch):
+    """Disconnect cancels a pending search-debounce timer (v1.8.6):
+    typing then disconnecting within 150 ms must not run the filter
+    after disconnect, and disconnect itself must not raise."""
+    import time
+    calls = []
+    orig_apply = MSATApp._ad_apply_filter
+
+    def _counting(self):
+        calls.append(1)
+        return orig_apply(self)
+
+    # Patch the class method before building the app: _make_search_row
+    # captures the bound method at construction time, so the debounced
+    # callback must already be the counting wrapper.
+    monkeypatch.setattr(MSATApp, "_ad_apply_filter", _counting)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+         "type": "user", "description": "Manager", "status": "Enabled"},
+    ]
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 2
+    entry = app._search_entries[0]  # AD search entry
+    entry.focus_force()
+    app._ad_search_var.set("john")
+    entry.event_generate("<KeyRelease>", keysym="n")
+    root.update()
+    # A timer is now pending (the debounce has not fired).
+    assert app._search_debounce_pending[0].get("after_id") is not None
+    # Disconnect before the 150 ms debounce elapses.
+    calls.clear()
+    app._global_disconnect()
+    root.update_idletasks()
+    # The pending timers were cancelled and forgotten.
+    assert all(p.get("after_id") is None
+               for p in app._search_debounce_pending)
+    time.sleep(0.25)
+    root.update()
+    # The filter did not run after disconnect, and the list stayed empty.
+    assert calls == []
+    assert len(app.ad_list.get_children()) == 0
+
+
+def test_search_clear_button_still_filters_immediately(root, patched_clients):
+    """The × clear button filters immediately, not via the debounce
+    (v1.8.6): it is unaffected by the disconnect-timer tracking."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+         "type": "user", "description": "Manager", "status": "Enabled"},
+    ]
+    app._ad_search_var.set("john")
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 1
+    app._search_clear_btns[0].invoke()
+    root.update_idletasks()
+    assert app._ad_search_var.get() == ""
+    assert len(app.ad_list.get_children()) == 2
+
+
 def test_edit_record_dialog_empty_ttl_does_not_raise(root):
     """An empty TTL in the record does not crash EditRecordDialog
     (v1.8.5): int(float('')) used to raise ValueError."""
