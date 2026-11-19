@@ -406,6 +406,11 @@ class MSATApp:
         self._dhcp_server = None
         self.dns = None
         self.creds.clear()
+        # Wipe the password from the UI as well as the store: the
+        # entry field and its StringVar would otherwise keep the
+        # password in memory (and visible) after disconnecting,
+        # against the wipe-on-disconnect model in credentials.py.
+        self.password_var.set("")
         # Role detection is per-connection: forget it all, so the
         # next connect re-detects for its own server.
         self._roles = {}
@@ -499,16 +504,27 @@ class MSATApp:
     def _discover_dhcp(self, refresh=False):
         """Find the servers with the DHCP role, connected server first.
 
-        Checks the connected server, then the other configured
-        servers in order. Sets ``_dhcp_candidates`` (in check order),
-        ``_dhcp_enabled`` and the DHCP role note. Returns True when
-        at least one server has the DHCP role. A server whose
-        detection fails is skipped — it cannot be confirmed to have
-        DHCP.
+        Sets ``_dhcp_candidates`` (in check order), ``_dhcp_enabled``
+        and the DHCP role note. Returns True when at least one server
+        has the DHCP role. A server whose detection fails is skipped —
+        it cannot be confirmed to have DHCP.
+
+        Fast path: when the connected server itself has the DHCP
+        role, it IS the DHCP server, so probing the other configured
+        servers adds dead wait on every connect — and stalls the UI
+        until WinRM times out if one is offline or firewalled. The
+        picker is hidden whenever the connected server has DHCP, so
+        the other servers would never be shown anyway.
         """
         server = self.server_var.get().strip()
-        ordered = [server] + [s for s in self.settings["servers"]
-                              if s != server]
+        roles = self._detect_roles(server, refresh=refresh)
+        if roles is not None and roles["DHCP"]:
+            self._dhcp_candidates = [server]
+            self._dhcp_enabled = True
+            self._role_notes.pop("dhcp", None)
+            self.dhcp_server_var.set(server)
+            return True
+        ordered = [s for s in self.settings["servers"] if s != server]
         candidates = []
         for cand in ordered:
             roles = self._detect_roles(cand, refresh=refresh)
@@ -547,11 +563,13 @@ class MSATApp:
                 else:
                     btn.config(state=tk.DISABLED)
             self._dns_search_entry.config(state=tk.DISABLED)
+            self._dns_search_clear_btn.config(state=tk.DISABLED)
         elif connected:
             self.dns_note.config(text="")
             for btn in self.dns_toolbar_buttons:
                 btn.config(state=tk.NORMAL)
             self._dns_search_entry.config(state=tk.NORMAL)
+            self._dns_search_clear_btn.config(state=tk.NORMAL)
         else:
             self.dns_note.config(text="")
         if connected and not self._dhcp_enabled:
@@ -563,11 +581,13 @@ class MSATApp:
                 else:
                     btn.config(state=tk.DISABLED)
             self._dhcp_search_entry.config(state=tk.DISABLED)
+            self._dhcp_search_clear_btn.config(state=tk.DISABLED)
         elif connected:
             self._update_dhcp_labels()
             for btn in self.dhcp_toolbar_buttons:
                 btn.config(state=tk.NORMAL)
             self._dhcp_search_entry.config(state=tk.NORMAL)
+            self._dhcp_search_clear_btn.config(state=tk.NORMAL)
         else:
             self.dhcp_note.config(text="")
 
@@ -627,6 +647,10 @@ class MSATApp:
             return
         self._ensure_dhcp()
         self._dhcp_refresh()
+        # The "Managing DHCP on ..." label is built from the effective
+        # DHCP server; refresh it here, or it stays stuck on the
+        # previous server after a switch.
+        self._update_dhcp_labels()
 
     def _update_dhcp_labels(self):
         """Rebuild the DHCP note/picker text from role detection.
@@ -718,7 +742,20 @@ class MSATApp:
         entry = ttk.Entry(frame, textvariable=var, width=32,
                           state=tk.DISABLED)
         entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
-        entry.bind("<KeyRelease>", lambda _e: on_change())
+        # Debounce the filter: rebuilding the whole Treeview on every
+        # keystroke is instant for a few hundred rows, but in a large
+        # DNS zone (thousands of records) it lags typing. Wait ~150 ms
+        # after the last keystroke before filtering; a new keystroke
+        # cancels the pending filter. The clear (×) button below still
+        # filters immediately — clearing is a deliberate action.
+        _pending = {"after_id": None}
+
+        def _on_key_release(_event):
+            if _pending["after_id"] is not None:
+                entry.after_cancel(_pending["after_id"])
+            _pending["after_id"] = entry.after(150, on_change)
+
+        entry.bind("<KeyRelease>", _on_key_release)
         # A small clear (×) button beside the entry: empties the
         # search text and re-runs the filter, restoring the full,
         # unfiltered list. Always visible — simpler and more reliable
@@ -814,21 +851,24 @@ class MSATApp:
         self._ad_current_dn = None
         self._ad_rows = []  # canonical rows for the current container
 
-    def _ad_ensure_tree_children(self, dn):
+    def _ad_ensure_tree_children(self, dn, children=None):
         """Replace a tree node's 'Loading…' placeholder with its real children.
 
         No-op when the node has no placeholder (already loaded) or does
         not exist in the tree. Returns True when children were loaded.
+        ``children`` may be a list already fetched for this DN (the
+        list view just loaded it) — passing it avoids a second LDAP
+        query for the same DN.
         """
         if self.ad_client is None or not dn:
             return False
         if not self.ad_tree.exists(dn):
             return False
-        children = self.ad_tree.get_children(dn)
-        if not children or not children[0].endswith(_LOADING_SUFFIX):
+        node_children = self.ad_tree.get_children(dn)
+        if not node_children or not node_children[0].endswith(_LOADING_SUFFIX):
             return False
-        self.ad_tree.delete(children[0])
-        self._ad_populate_tree_children(dn)
+        self.ad_tree.delete(node_children[0])
+        self._ad_populate_tree_children(dn, children)
         return True
 
     def _ad_on_tree_open(self, _event):
@@ -904,22 +944,25 @@ class MSATApp:
         if first_error:
             self._error(first_error[0])
 
-    def _ad_populate_tree_children(self, parent_dn):
+    def _ad_populate_tree_children(self, parent_dn, children=None):
         # Runs on the UI thread deliberately: the ldap3 connection is
         # bound on this thread and is not safe to use from a worker
         # thread (a background-thread search returns operationsError
         # from the DC). A slow DC can briefly block the UI; that is
-        # preferable to a broken search.
-        try:
-            children = self.ad_client.list_children(parent_dn)
-        except Exception as exc:  # noqa: BLE001 - shown to the user
-            # Put the placeholder back so the user can retry by
-            # collapsing and re-expanding the node.
-            self.ad_tree.insert(parent_dn, tk.END,
-                                iid=parent_dn + _LOADING_SUFFIX,
-                                text="Loading…")
-            self._error(exc)
-            return
+        # preferable to a broken search. ``children`` may already
+        # hold this DN's children (fetched for the list view) — only
+        # query when it is None.
+        if children is None:
+            try:
+                children = self.ad_client.list_children(parent_dn)
+            except Exception as exc:  # noqa: BLE001 - shown to the user
+                # Put the placeholder back so the user can retry by
+                # collapsing and re-expanding the node.
+                self.ad_tree.insert(parent_dn, tk.END,
+                                    iid=parent_dn + _LOADING_SUFFIX,
+                                    text="Loading…")
+                self._error(exc)
+                return
         for child in children:
             if child["type"] in ("ou", "container", "domain"):
                 self.ad_tree.insert(parent_dn, tk.END, iid=child["dn"],
@@ -936,24 +979,32 @@ class MSATApp:
         if dn.endswith(_LOADING_SUFFIX):
             return
         self._ad_current_dn = dn
-        self._ad_refresh_list(dn)
         # Selecting a node also loads its tree children, so a click on
         # the disclosure triangle (which selects the node) populates
         # the tree even if the open event's focus has not settled yet.
-        self._ad_ensure_tree_children(dn)
+        # The list view just fetched this DN's children; hand them to
+        # the tree population so it does not run the same LDAP query
+        # a second time for the same DN. On a list failure (children
+        # is None) the tree keeps its placeholder for a retry instead
+        # of firing a second, also-failing query.
+        children = self._ad_refresh_list(dn)
+        if children is not None:
+            self._ad_ensure_tree_children(dn, children)
 
     def _ad_refresh_list(self, dn):
+        """Load the list for ``dn``; returns the children (None on failure)."""
         if self.ad_client is None:
-            return
+            return None
         try:
             children = self.ad_client.list_children(dn)
         except Exception as exc:  # noqa: BLE001 - shown to the user
             self._error(exc)
-            return
+            return None
         # Keep the full list in memory; the search box filters the
         # displayed rows from it without a new LDAP query.
         self._ad_rows = children
         self._ad_apply_filter()
+        return children
 
     def _ad_apply_filter(self):
         """Repopulate the object list from the loaded rows, applying the search text."""
@@ -1025,12 +1076,14 @@ class MSATApp:
             return
         data = dlg.result
         try:
+            # must_change goes straight into create_user, which sets
+            # pwdLastSet = 0 after the password — the old code called
+            # reset_password() here instead, which wrote unicodePwd a
+            # second time for the same password.
             dn = self.ad_client.create_user(
                 data["ou"], data["sam"], data["given"], data["sn"],
-                data["display"], data["password"])
-            if data["must_change"]:
-                self.ad_client.reset_password(dn, data["password"],
-                                              must_change=True)
+                data["display"], data["password"],
+                must_change=data["must_change"])
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
@@ -1302,6 +1355,7 @@ class MSATApp:
         self._dhcp_search_var = self._make_search_row(
             self.dhcp_tab, self._dhcp_apply_filter)
         self._dhcp_search_entry = self._search_entries[-1]
+        self._dhcp_search_clear_btn = self._search_clear_btns[-1]
 
         scope_cols = ("ScopeId", "Name", "SubnetMask", "State",
                       "StartRange", "EndRange", "LeaseDuration")
@@ -1399,14 +1453,21 @@ class MSATApp:
         self.set_status("Loaded {} DHCP scope(s).".format(len(scopes)))
         return True
 
-    def _dhcp_on_scope_select(self, _event):
-        sel = self.dhcp_scopes.selection()
-        if not sel:
+    def _dhcp_refresh_scope(self, scope_id):
+        """Reload the leases and reservations for one scope.
+
+        Uses the scope id directly — not the tree selection — so a
+        refresh after an add/edit/remove still works when a search
+        filter is active: filtering rebuilds the scopes tree and
+        wipes the selection, which used to make the post-change
+        refresh a no-op and leave the lists stale. Also sets
+        ``_dhcp_current_scope`` so the scope stays current.
+        """
+        if not scope_id:
             return
         dhcp = self._ensure_dhcp()
         if dhcp is None:
             return
-        scope_id = self.dhcp_scopes.item(sel[0], "values")[0]
         self._dhcp_current_scope = scope_id
         try:
             leases = dhcp.list_leases(scope_id)
@@ -1419,6 +1480,13 @@ class MSATApp:
         self._dhcp_apply_filter()
         self.set_status("Scope {}: {} lease(s), {} reservation(s).".format(
             scope_id, len(leases), len(reservations)))
+
+    def _dhcp_on_scope_select(self, _event):
+        sel = self.dhcp_scopes.selection()
+        if not sel:
+            return
+        scope_id = self.dhcp_scopes.item(sel[0], "values")[0]
+        self._dhcp_refresh_scope(scope_id)
 
     def _dhcp_add_reservation(self):
         dhcp = self._ensure_dhcp()
@@ -1438,7 +1506,7 @@ class MSATApp:
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dhcp_on_scope_select(None)
+        self._dhcp_refresh_scope(self._dhcp_current_scope)
         self.set_status("Added reservation {} ({}).".format(data["ip"], data["name"]))
 
     def _dhcp_edit_reservation(self):
@@ -1463,13 +1531,19 @@ class MSATApp:
             return
         data = dlg.result
         try:
+            # The old values go along so a failed MAC-change re-create
+            # can roll the old reservation back (see
+            # DHCPManager.update_reservation).
             outcome = dhcp.update_reservation(
                 self._dhcp_current_scope, reservation["ClientId"],
-                data["ip"], data["mac"], data["name"], data["description"])
+                data["ip"], data["mac"], data["name"], data["description"],
+                old_ip_address=reservation["IPAddress"],
+                old_name=reservation["Name"],
+                old_description=reservation["Description"])
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dhcp_on_scope_select(None)
+        self._dhcp_refresh_scope(self._dhcp_current_scope)
         if outcome == "recreated":
             self.set_status(
                 "Recreated reservation {} ({}) with the new MAC {}.".format(
@@ -1500,7 +1574,7 @@ class MSATApp:
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dhcp_on_scope_select(None)
+        self._dhcp_refresh_scope(self._dhcp_current_scope)
         self.set_status("Removed reservation {}.".format(ip))
 
     def _dhcp_superscopes(self):
@@ -1549,6 +1623,7 @@ class MSATApp:
         self._dns_search_var = self._make_search_row(
             self.dns_tab, self._dns_apply_filter)
         self._dns_search_entry = self._search_entries[-1]
+        self._dns_search_clear_btn = self._search_clear_btns[-1]
 
         paned = ttk.PanedWindow(self.dns_tab, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -1644,11 +1719,18 @@ class MSATApp:
         self.set_status("Loaded {} DNS zone(s).".format(len(zones)))
         return True
 
-    def _dns_on_zone_select(self, _event):
-        sel = self.dns_zones.selection()
-        if not sel or self.dns is None:
+    def _dns_refresh_zone(self, zone):
+        """Reload the records for one zone.
+
+        Uses the zone name directly — not the tree selection — so a
+        refresh after an add/edit/remove still works when a search
+        filter is active: filtering rebuilds the zones tree and wipes
+        the selection, which used to make the post-change refresh a
+        no-op and leave the records stale. Also sets
+        ``_dns_current_zone`` so the zone stays current.
+        """
+        if not zone or self.dns is None:
             return
-        zone = self.dns_zones.item(sel[0], "values")[0]
         self._dns_current_zone = zone
         try:
             records = self.dns.list_records(zone)
@@ -1658,6 +1740,13 @@ class MSATApp:
         self._dns_records_rows = records
         self._dns_apply_filter()
         self.set_status("Zone {}: {} record(s).".format(zone, len(records)))
+
+    def _dns_on_zone_select(self, _event):
+        sel = self.dns_zones.selection()
+        if not sel or self.dns is None:
+            return
+        zone = self.dns_zones.item(sel[0], "values")[0]
+        self._dns_refresh_zone(zone)
 
     def _dns_add_record(self):
         if self.dns is None or not self._dns_current_zone:
@@ -1683,7 +1772,7 @@ class MSATApp:
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dns_on_zone_select(None)
+        self._dns_refresh_zone(self._dns_current_zone)
         self.set_status("Added {} record {} in {}.".format(
             data["type"], data["name"], zone))
 
@@ -1721,7 +1810,7 @@ class MSATApp:
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dns_on_zone_select(None)
+        self._dns_refresh_zone(self._dns_current_zone)
         self.set_status("Updated {} record {} in {}.".format(
             rec.get("RecordType"), rec.get("HostName"), zone))
 
@@ -1751,7 +1840,7 @@ class MSATApp:
         except Exception as exc:  # noqa: BLE001
             self._error(exc)
             return
-        self._dns_on_zone_select(None)
+        self._dns_refresh_zone(self._dns_current_zone)
         self.set_status("Removed {} record {}.".format(
             rec.get("RecordType"), rec.get("HostName")))
 

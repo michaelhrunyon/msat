@@ -176,6 +176,22 @@ def test_get_root_dse_parses_entries(client, monkeypatch):
     assert root_dse["defaultNamingContext"] == DOMAIN_DN
     assert root_dse["forestFunctionality"] == "7"
     assert root_dse["dnsHostName"] == "dc1.example.local"
+    # namingContexts stays a list (v1.8.5): the old code collapsed it
+    # to its first element, so the Directory Info tab could only ever
+    # show one naming context.
+    assert root_dse["namingContexts"] == [DOMAIN_DN, CONFIG_DN]
+
+
+def test_get_root_dse_naming_contexts_single_value_is_a_list(client,
+                                                             monkeypatch):
+    """A single naming context is still returned as a one-item list."""
+    canned = [{"dn": "", "attributes": {
+        "defaultNamingContext": [DOMAIN_DN],
+        "namingContexts": [DOMAIN_DN],
+    }}]
+    monkeypatch.setattr(client, "_search", lambda *a, **k: canned)
+    root_dse = client.get_root_dse()
+    assert root_dse["namingContexts"] == [DOMAIN_DN]
 
 
 def test_get_object_missing_raises(client):
@@ -239,6 +255,176 @@ def test_search_users_excludes_computers(client):
 def test_search_groups(client):
     results = client.search_groups(DOMAIN_DN, "Adm")
     assert [r["sam"] for r in results] == ["Admins"]
+
+
+def test_search_users_escapes_filter_chars_rfc4515(client, monkeypatch):
+    """Search queries use RFC 4515 hex escapes (v1.8.5).
+
+    The old code used backslash literals (\\(, \\), \\*, \\\\), which
+    are not valid filter escapes and fail or misbehave against AD.
+    """
+    captured = {}
+
+    def fake_search(base_dn, search_filter, attributes, scope=None):
+        captured["filter"] = search_filter
+        return []
+
+    monkeypatch.setattr(client, "_search", fake_search)
+    client.search_users(DOMAIN_DN, "Doe (x)*\\")
+    search_filter = captured["filter"]
+    assert "\\28" in search_filter  # (
+    assert "\\29" in search_filter  # )
+    assert "\\2a" in search_filter  # *
+    assert "\\5c" in search_filter  # backslash
+    assert "\\(" not in search_filter
+    assert "\\)" not in search_filter
+    assert "\\*" not in search_filter
+
+
+def test_search_computers_and_groups_escape_filter_chars(client, monkeypatch):
+    """The same RFC 4515 escaping applies to computer/group search."""
+    captured = {}
+
+    def fake_search(base_dn, search_filter, attributes, scope=None):
+        captured["filter"] = search_filter
+        return []
+
+    monkeypatch.setattr(client, "_search", fake_search)
+    client.search_computers(DOMAIN_DN, "WS(01)*")
+    assert "\\28" in captured["filter"]
+    assert "\\2a" in captured["filter"]
+    client.search_groups(DOMAIN_DN, "Admins*")
+    assert "\\2a" in captured["filter"]
+
+
+def test_resolve_members_escapes_dn_with_escaped_comma(client, monkeypatch):
+    """resolve_members escapes a DN containing an escaped comma (v1.8.5).
+
+    A DN such as CN=Doe\\, John,... must have its backslash escaped
+    as \\5c in the filter; the old hand-rolled escaper produced a
+    literal backslash that broke the filter.
+    """
+    captured = {}
+    dn = "CN=Doe\\, John,OU=Users," + DOMAIN_DN
+
+    def fake_search(base_dn, search_filter, attributes, scope=None):
+        captured["filter"] = search_filter
+        return []
+
+    monkeypatch.setattr(client, "_search", fake_search)
+    client.resolve_members([dn])
+    assert "distinguishedName=CN=Doe\\5c, John,OU=Users," + DOMAIN_DN \
+        in captured["filter"]
+
+
+def test_create_user_escapes_comma_in_display_name(client):
+    """A display name with a comma is RDN-escaped in the DN (v1.8.5)."""
+    dn = client.create_user("OU=Users," + DOMAIN_DN, "jdoe2",
+                            given_name="John", sn="Doe",
+                            display_name="Doe, John", password="Temp1234!")
+    assert dn == "CN=Doe\\, John,OU=Users," + DOMAIN_DN
+    created = client.get_object(dn)
+    assert created["sam"] == "jdoe2"
+    assert created["display_name"] == "Doe, John"
+
+
+def test_create_computer_and_group_escape_comma_in_name(client):
+    """Computer and group names with a comma are RDN-escaped too."""
+    dn = client.create_computer("OU=IT," + DOMAIN_DN, "WS,02")
+    assert dn == "CN=WS\\,02,OU=IT," + DOMAIN_DN
+    assert client.get_object(dn)["type"] == "computer"
+    dn = client.create_group("OU=IT," + DOMAIN_DN, "Help, Desk",
+                             "HelpDesk2", "Global security")
+    assert dn == "CN=Help\\, Desk,OU=IT," + DOMAIN_DN
+    assert client.get_object(dn)["type"] == "group"
+
+
+def test_create_user_with_must_change_sets_pwd_last_set(client):
+    """create_user(must_change=True) sets pwdLastSet=0 in the same
+    call (v1.8.5) — no second password write is needed."""
+    dn = client.create_user("OU=Users," + DOMAIN_DN, "jsmith2",
+                            given_name="Jane", sn="Smith",
+                            display_name="Jane Smith", password="Temp1234!",
+                            must_change=True)
+    entry = client.conn.strategy.entries[dn]
+    assert entry["unicodePwd"] == [encode_password("Temp1234!")]
+    assert _stored_values(entry, "pwdLastSet") == ["0"]
+    assert client.get_object(dn)["uac"] == 512
+
+
+def test_search_uses_paged_search_for_real_connections():
+    """_search pages through a real (non-mock) connection (v1.8.5).
+
+    A stub connection whose strategy is not MOCK_SYNC: paged_search
+    is used with paged_size=500 and generator=False, and the raw
+    response dicts are converted to the {'dn', 'attributes'} shape.
+    Non-entry responses (e.g. searchResDone) are dropped.
+    """
+    from msat.ldap_client import ADClient
+
+    class _FakePaged:
+        def paged_search(self, base, search_filter, search_scope=None,
+                         attributes=None, paged_size=100, generator=True):
+            assert paged_size == 500
+            assert generator is False
+            assert search_filter == "(sAMAccountName=jdoe)"
+            return [
+                {"dn": "CN=jdoe,OU=Users,DC=example,DC=local",
+                 "attributes": {"sAMAccountName": ["jdoe"],
+                                "name": ["John Doe"]},
+                 "type": "searchResEntry"},
+                {"dn": "", "attributes": {}, "type": "searchResDone"},
+            ]
+
+    class _FakeExtend:
+        def __init__(self):
+            self.standard = _FakePaged()
+
+    class _FakeStrategy:
+        pass
+
+    class _FakeConn:
+        def __init__(self):
+            self.strategy = _FakeStrategy()
+            self.extend = _FakeExtend()
+            self.result = {"result": 0, "description": "success"}
+
+    ad = ADClient(domain="example.local")
+    ad.conn = _FakeConn()
+    ad._connected = True
+    results = ad._search(DOMAIN_DN, "(sAMAccountName=jdoe)",
+                         ["sAMAccountName", "name"])
+    assert len(results) == 1  # the searchResDone entry is dropped
+    assert results[0]["dn"] == "CN=jdoe,OU=Users,DC=example,DC=local"
+    assert results[0]["attributes"]["sAMAccountName"] == ["jdoe"]
+
+
+def test_search_paged_error_raises(client, monkeypatch):
+    """A non-zero result code from the paged search raises ADError."""
+    from msat.ldap_client import ADError
+
+    class _FakePaged:
+        def paged_search(self, *args, **kwargs):
+            return []
+
+    class _FakeExtend:
+        def __init__(self):
+            self.standard = _FakePaged()
+
+    class _FakeStrategy:
+        pass
+
+    class _FakeConn:
+        def __init__(self):
+            self.strategy = _FakeStrategy()
+            self.extend = _FakeExtend()
+            self.result = {"result": 32, "description": "noSuchObject"}
+
+    ad = ADClient(domain="example.local")
+    ad.conn = _FakeConn()
+    ad._connected = True
+    with pytest.raises(ADError):
+        ad._search(DOMAIN_DN, "(objectClass=*)", ["distinguishedName"])
 
 
 def test_search_computers(client):
@@ -329,14 +515,6 @@ def test_delete_object(client):
     dn = client.create_user("OU=Users," + DOMAIN_DN, "todelete", password="Temp1234!")
     client.delete_object(dn)
     assert dn not in client.conn.strategy.entries
-
-
-def test_set_attributes(client):
-    dn = "CN=jdoe,OU=Users," + DOMAIN_DN
-    client.set_attributes(dn, {"description": "Updated", "title": "Analyst"})
-    entry = client.conn.strategy.entries[dn]
-    assert _stored_values(entry, "description") == ["Updated"]
-    assert _stored_values(entry, "title") == ["Analyst"]
 
 
 def test_display_value_hex_for_binary():

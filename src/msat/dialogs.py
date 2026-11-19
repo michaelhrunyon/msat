@@ -12,7 +12,6 @@ import webbrowser
 from tkinter import messagebox, ttk
 
 from . import updater
-from .constants import DEFAULT_DOMAIN, DEFAULT_LDAPS_PORT, DEFAULT_WINRM_PORT
 from .dhcp import normalize_mac, validate_ipv4
 from .dns import validate_ipv6
 from .ldap_client import GROUP_TYPES, is_locked_out
@@ -105,55 +104,6 @@ def _need(entry, label):
         entry.focus_set()
         return None
     return value
-
-
-# --------------------------------------------------------------------------
-# Connection
-# --------------------------------------------------------------------------
-
-class ConnectionDialog(DialogBase):
-    """Server / domain / username / password (+ port).
-
-    ``server_choices`` is the list for the server dropdown (editable, so
-    any hostname can still be typed). ``port_label`` distinguishes the
-    LDAPS (AD) connection from the WinRM (DHCP/DNS) connection.
-    """
-
-    def __init__(self, parent, title, server_choices, default_server,
-                 default_domain=DEFAULT_DOMAIN, default_port=DEFAULT_LDAPS_PORT,
-                 port_label="LDAPS port"):
-        super().__init__(parent, title, ok_text="Connect")
-        self.server = self._combo_row("Server", server_choices, default_server)
-        self.domain = self._row("Domain", default_domain)
-        self.username = self._row("Username")
-        self.password = self._row("Password", show="*")
-        self.port = self._row(port_label, str(default_port), width=10)
-        self._finish_buttons()
-
-    def validate(self):
-        for entry, label in ((self.server, "Server"), (self.username, "Username"),
-                             (self.password, "Password")):
-            if _need(entry, label) is None:
-                return False
-        try:
-            port = int(self.port.get().strip())
-            if not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("Invalid port", "Port must be a number 1-65535.",
-                                   parent=self)
-            self.port.focus_set()
-            return False
-        return True
-
-    def collect(self):
-        return {
-            "server": self.server.get().strip(),
-            "domain": self.domain.get().strip(),
-            "username": self.username.get().strip(),
-            "password": self.password.get(),
-            "port": int(self.port.get().strip()),
-        }
 
 
 # --------------------------------------------------------------------------
@@ -1142,10 +1092,15 @@ class AddRecordDialog(DialogBase):
                 return False
         if self.ttl.get().strip():
             try:
-                int(self.ttl.get().strip())
+                ttl_value = int(self.ttl.get().strip())
             except ValueError:
                 messagebox.showwarning("Invalid TTL",
                                        "TTL must be a number of seconds.",
+                                       parent=self)
+                return False
+            if ttl_value < 0:
+                messagebox.showwarning("Invalid TTL",
+                                       "TTL cannot be negative.",
                                        parent=self)
                 return False
         return True
@@ -1212,7 +1167,16 @@ class EditRecordDialog(DialogBase):
             self.preference.pack(anchor=tk.W, pady=2)
             self.preference.insert(0, pref_value)
         ttl = record.get("TTL")
-        ttl_text = str(int(float(ttl))) if ttl is not None else ""
+        # The TTL arrives as seconds (a float from the JSON, e.g.
+        # 3600.0). Guard against a missing, empty or non-numeric
+        # value — int(float("")) raises ValueError, and a record
+        # with no TTL must simply show an empty field.
+        ttl_text = ""
+        if ttl not in (None, ""):
+            try:
+                ttl_text = str(int(float(ttl)))
+            except (TypeError, ValueError):
+                ttl_text = ""
         self.ttl = self._row("TTL in seconds", ttl_text)
         self._finish_buttons()
 
@@ -1239,10 +1203,15 @@ class EditRecordDialog(DialogBase):
                 return False
         if self.ttl.get().strip():
             try:
-                int(self.ttl.get().strip())
+                ttl_value = int(self.ttl.get().strip())
             except ValueError:
                 messagebox.showwarning("Invalid TTL",
                                        "TTL must be a number of seconds.",
+                                       parent=self)
+                return False
+            if ttl_value < 0:
+                messagebox.showwarning("Invalid TTL",
+                                       "TTL cannot be negative.",
                                        parent=self)
                 return False
         return True

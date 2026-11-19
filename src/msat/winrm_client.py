@@ -147,8 +147,8 @@ def detect_server_roles(client):
         names = {str(row.get("Name", "")).upper()
                  for row in rows if row.get("Installed")}
         return {"DNS": "DNS" in names, "DHCP": "DHCP" in names}
-    names = {str(row.get("Name", "")) for row in rows}
-    return {"DNS": "DNS" in names, "DHCP": "DHCPServer" in names}
+    names = {str(row.get("Name", "")).upper() for row in rows}
+    return {"DNS": "DNS" in names, "DHCP": "DHCPSERVER" in names}
 
 
 def ps_quote(value):

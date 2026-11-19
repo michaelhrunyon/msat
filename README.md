@@ -30,7 +30,8 @@ the Group Policy Management Console on a domain controller.
   while a connection is underway; once connected it returns to
   gray and Disconnect is blue instead, so the blue button always
   shows the current state. If the connection fails, both return
-  to gray.
+  to gray. Disconnect also clears the password field, so the
+  password is not left sitting in the UI after you disconnect.
 - **Credential validation up front.** Connect gates on the LDAP bind
   and a small validation search before anything is marked connected.
   If the username or password is wrong, the app stays disconnected
@@ -87,12 +88,17 @@ the Group Policy Management Console on a domain controller.
   record untouched.
 - **Directory Info (read-only):** forest/domain naming contexts and
   functional levels, AD sites with their subnets, and trusted domains.
+  All naming contexts are shown, not just the first.
 - **Search:** the AD, DHCP and DNS tabs each have a Search box above
   their lists, and the Properties Attribute Editor has one too. It
   filters the rows already loaded, as you type (case-insensitive);
   clearing it shows everything again. Each search box has a small
   **×** button beside it that clears the search text and restores
-  the full list.
+  the full list. The filter waits a short moment after you stop
+  typing before rebuilding the list, so typing stays smooth in
+  large zones. Adding, editing or removing a DHCP reservation or
+  DNS record refreshes that scope or zone even while a search
+  filter is active, so the list no longer goes stale after a change.
 - **Update check:** shortly after launch the app quietly checks
   GitHub Releases for a newer published version. Help → Check for
   Updates… runs the same check on demand. Nothing happens when you
@@ -281,7 +287,7 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.4** — tested against a live Active Directory environment (3 DCs). 190 tests passing.
+**v1.8.5** — tested against a live Active Directory environment (3 DCs). 218 tests passing.
 
 ## Known limitations
 

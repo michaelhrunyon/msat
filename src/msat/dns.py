@@ -19,10 +19,15 @@ from .dhcp import validate_ipv4  # reuse the IPv4 validator
 
 
 def validate_ipv6(address):
-    """Return the address if it is a valid IPv6 address, else ValueError."""
+    """Return the address if it is a valid IPv6 address, else ValueError.
+
+    Uses IPv6Address, not ip_address: the latter also accepts IPv4
+    addresses, so an IPv4 address passed validation here and only
+    failed server-side when editing an AAAA record.
+    """
     import ipaddress
     try:
-        return str(ipaddress.ip_address(address))
+        return str(ipaddress.IPv6Address(address))
     except ValueError:
         raise ValueError("Invalid IPv6 address: {}".format(address))
 

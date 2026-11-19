@@ -20,6 +20,9 @@ AD-specific details handled here:
 from ldap3 import ALL, BASE, LEVEL, SUBTREE, Connection, Server
 from ldap3 import MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
 from ldap3.core.exceptions import LDAPException
+from ldap3.strategy.mockSync import MockSyncStrategy
+from ldap3.utils.conv import escape_filter_chars
+from ldap3.utils.dn import escape_rdn
 
 from .constants import DEFAULT_LDAPS_PORT
 
@@ -338,6 +341,42 @@ class ADClient:
         an error — so success is judged by the LDAP result code (0),
         not by the boolean ldap3 returns (its mock strategy returns
         False for empty result sets).
+
+        Real connections use a paged search (500 entries per page):
+        Active Directory's default MaxPageSize is 1,000, so a single
+        unpaged search silently truncates (or errors on) any OU or
+        search returning more than 1,000 objects. The paged search
+        returns raw response dicts, which are converted to the same
+        {'dn', 'attributes'} shape as the unpaged path. Mock
+        connections (tests, MOCK_SYNC) keep the plain unpaged search:
+        the mock strategy does not model paged results.
+        """
+        self._require_connection()
+        if isinstance(self.conn.strategy, MockSyncStrategy):
+            return self._search_unpaged(base_dn, search_filter, attributes,
+                                       scope)
+        try:
+            responses = self.conn.extend.standard.paged_search(
+                base_dn, search_filter, search_scope=scope,
+                attributes=attributes, paged_size=500, generator=False)
+        except LDAPException as exc:
+            raise ADError("LDAP search failed: {}".format(exc)) from exc
+        code = self.conn.result.get("result")
+        if code is not None and code != 0:
+            raise ADError("LDAP search failed: {}".format(
+                self.conn.result.get("description", "unknown error")))
+        return [{"dn": entry["dn"], "attributes": entry["attributes"]}
+                for entry in responses
+                if entry.get("type") == "searchResEntry"]
+
+    def _search_unpaged(self, base_dn, search_filter, attributes,
+                        scope=SUBTREE):
+        """The single unpaged search, used only for mock connections.
+
+        Kept separate so the paged path above stays the one real
+        servers use, while tests (ldap3 MOCK_SYNC) keep the plain
+        search the mock models. Success is judged by the LDAP result
+        code (0), not by the boolean ldap3 returns.
         """
         self._require_connection()
         try:
@@ -440,7 +479,7 @@ class ADClient:
         if "namingContexts" not in attrs and naming_contexts:
             attrs["namingContexts"] = list(naming_contexts)
         if attrs:
-            return {key: _first(attrs, key) for key in attrs}
+            return self._root_dse_values(attrs)
         entries = self._search("", "(objectClass=*)",
                                ["defaultNamingContext", "configurationNamingContext",
                                 "rootDomainNamingContext", "forestFunctionality",
@@ -450,7 +489,31 @@ class ADClient:
         if not entries:
             return {}
         attrs = entries[0]["attributes"]
-        return {key: _first(attrs, key) for key in attrs}
+        return self._root_dse_values(attrs)
+
+    @staticmethod
+    def _root_dse_values(attrs):
+        """Collapse rootDSE attributes to single values — except
+        ``namingContexts``, which stays a list.
+
+        Every other rootDSE attribute is single-valued, so _first()
+        is right for them. namingContexts is multi-valued by
+        definition (every naming context the DC hosts); collapsing
+        it to its first element hides the rest, even though the
+        Directory Info tab explicitly joins a list of them.
+        """
+        result = {}
+        for key, values in attrs.items():
+            if key == "namingContexts":
+                if isinstance(values, (list, tuple)):
+                    result[key] = [_decode(v) for v in values]
+                elif values is None:
+                    result[key] = []
+                else:
+                    result[key] = [_decode(values)]
+            else:
+                result[key] = _first(attrs, key)
+        return result
 
     def get_default_naming_context(self):
         """The domain DN, from the rootDSE or computed from the domain."""
@@ -535,9 +598,12 @@ class ADClient:
         """Users whose name / sAMAccountName matches ``query``.
 
         Computer objects also carry objectClass=user in AD, so they
-        are excluded with (!(objectClass=computer)).
+        are excluded with (!(objectClass=computer)). The query is
+        escaped per RFC 4515 (hex escapes: \\28, \\29, \\2a, \\5c,
+        \\00) — the backslash literals the old code used are not
+        valid filter escapes and fail or misbehave against AD.
         """
-        q = query.replace(")", "\\)").replace("(", "\\(").replace("*", "\\*")
+        q = escape_filter_chars(query)
         search_filter = ("(&(objectClass=user)(!(objectClass=computer))"
                          "(|(name=*{0}*)(sAMAccountName=*{0}*)(displayName=*{0}*)))"
                          .format(q))
@@ -545,14 +611,14 @@ class ADClient:
         return [self.entry_to_dict(e) for e in entries]
 
     def search_computers(self, base_dn, query):
-        q = query.replace(")", "\\)").replace("(", "\\(").replace("*", "\\*")
+        q = escape_filter_chars(query)
         search_filter = ("(&(objectClass=computer)"
                          "(|(name=*{0}*)(sAMAccountName=*{0}*)))".format(q))
         entries = self._search(base_dn, search_filter, self.LIST_ATTRS)
         return [self.entry_to_dict(e) for e in entries]
 
     def search_groups(self, base_dn, query):
-        q = query.replace(")", "\\)").replace("(", "\\(").replace("*", "\\*")
+        q = escape_filter_chars(query)
         search_filter = ("(&(objectClass=group)"
                          "(|(name=*{0}*)(sAMAccountName=*{0}*)))".format(q))
         entries = self._search(base_dn, search_filter, self.LIST_ATTRS)
@@ -571,13 +637,13 @@ class ADClient:
         if not dns:
             return []
 
-        def esc(value):
-            return (value.replace("\\", "\\\\").replace("(", "\\(")
-                         .replace(")", "\\)").replace("*", "\\*")
-                         .replace("\x00", "\\00"))
-
-        parts = "".join("(distinguishedName={})".format(esc(dn))
-                        for dn in dns)
+        # DNs are filter values here, so they need RFC 4515 escaping
+        # (hex escapes). The old hand-rolled escaper used backslash
+        # literals, which break on a DN containing an escaped comma
+        # such as CN=Doe\, John — the backslash itself must be
+        # escaped as \5c, and ldap3's escape_filter_chars does that.
+        parts = "".join("(distinguishedName={})".format(
+            escape_filter_chars(dn)) for dn in dns)
         entries = self._search(self.get_default_naming_context(),
                                "(|{})".format(parts), self.LIST_ATTRS)
         by_dn = {}
@@ -600,16 +666,23 @@ class ADClient:
 
     def create_user(self, ou_dn, sam_account_name, given_name="", sn="",
                     display_name="", password=None, upn=None,
-                    user_account_control=UAC_NORMAL_ACCOUNT):
+                    user_account_control=UAC_NORMAL_ACCOUNT,
+                    must_change=False):
         """Create a user, then set its password and enable it.
 
         AD will not let an account be enabled without a password, so
         the object is created disabled (514), the password is set, and
         then the requested userAccountControl value is applied. Without
-        a password the account is left disabled.
+        a password the account is left disabled. When ``must_change``
+        is set, pwdLastSet is written to 0 here — in the same call —
+        so the caller does not reset the password a second time just
+        to force a change at next logon (that wrote unicodePwd twice).
+
+        The CN is RDN-escaped: a display name containing a comma
+        (e.g. "Doe, John") would otherwise break the DN.
         """
         cn = display_name or sam_account_name
-        dn = "CN={},{}".format(cn, ou_dn)
+        dn = "CN={},{}".format(escape_rdn(cn), ou_dn)
         attrs = {
             "sAMAccountName": sam_account_name,
             "userPrincipalName": upn or "{}@{}".format(sam_account_name, self.domain or ""),
@@ -623,11 +696,18 @@ class ADClient:
         if password:
             self.set_password(dn, password)
             self.set_user_account_control(dn, user_account_control)
+            if must_change:
+                self._modify(dn, {"pwdLastSet": [(MODIFY_REPLACE, [0])]},
+                             "Set 'must change password' for {}".format(dn))
         return dn
 
     def create_computer(self, ou_dn, name, description=""):
-        """Create a computer account (workstation trust, UAC 4096)."""
-        dn = "CN={},{}".format(name, ou_dn)
+        """Create a computer account (workstation trust, UAC 4096).
+
+        The CN is RDN-escaped, so a name containing a comma does not
+        break the DN.
+        """
+        dn = "CN={},{}".format(escape_rdn(name), ou_dn)
         attrs = {
             "sAMAccountName": name.upper() + "$",
             "userAccountControl": UAC_WORKSTATION_TRUST,
@@ -640,10 +720,14 @@ class ADClient:
 
     def create_group(self, ou_dn, name, sam_account_name, group_type=-2147483646,
                      description=""):
-        """Create a group. ``group_type`` may be an int or a friendly name."""
+        """Create a group. ``group_type`` may be an int or a friendly name.
+
+        The CN is RDN-escaped, so a name containing a comma does not
+        break the DN.
+        """
         if isinstance(group_type, str):
             group_type = GROUP_TYPES.get(group_type, -2147483646)
-        dn = "CN={},{}".format(name, ou_dn)
+        dn = "CN={},{}".format(escape_rdn(name), ou_dn)
         attrs = {
             "sAMAccountName": sam_account_name,
             "groupType": group_type,
@@ -688,17 +772,6 @@ class ADClient:
                          "Set 'must change password' for {}".format(dn))
 
     # -- attributes / membership / delete ---------------------------------
-
-    def set_attributes(self, dn, attributes):
-        """Set one or more attributes (values may be str/int/bytes/list)."""
-        changes = {}
-        for attr, value in attributes.items():
-            if value is None:
-                continue
-            values = value if isinstance(value, list) else [value]
-            changes[attr] = [(MODIFY_REPLACE, values)]
-        if changes:
-            self._modify(dn, changes, "Update attributes on {}".format(dn))
 
     def add_group_member(self, group_dn, member_dn):
         self._modify(group_dn, {"member": [(MODIFY_ADD, [member_dn])]},

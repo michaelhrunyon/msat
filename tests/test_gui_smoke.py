@@ -10,7 +10,7 @@ import pytest
 
 from msat.app import MSATApp
 from msat.constants import APP_TITLE
-from msat.dialogs import ConnectionDialog, SettingsDialog, UserPropertiesDialog
+from msat.dialogs import SettingsDialog, UserPropertiesDialog
 from msat.settings import default_settings
 from tests.conftest import FakeWinRMClient
 
@@ -432,35 +432,6 @@ def test_dhcp_falls_back_to_picker_when_global_server_is_dc3(root,
     app._dhcp_on_server_change()
     root.update_idletasks()
     assert app._dhcp_server == "dc2"
-
-
-def test_connection_dialog_builds_and_cancels(root):
-    dlg = ConnectionDialog(root, "Connect to Active Directory",
-                           ["dc1", "dc2", "dc3"],
-                           "dc1", "example.local", 636, "LDAPS port")
-    root.update_idletasks()
-    assert dlg.server.get() == "dc1"
-    assert dlg.domain.get() == "example.local"
-    assert dlg.port.get() == "636"
-    dlg._on_cancel()
-    assert dlg.result is None
-
-
-def test_connection_dialog_validates_port(root, monkeypatch):
-    # messagebox calls are modal and would block the test forever under
-    # xvfb, so stub them out and assert they were invoked instead.
-    shown = []
-    monkeypatch.setattr("msat.dialogs.messagebox.showwarning",
-                        lambda *a, **k: shown.append(a))
-    dlg = ConnectionDialog(root, "Connect", ["dc1"], "dc1",
-                           "example.local", 636, "LDAPS port")
-    dlg.username.insert(0, "michael")
-    dlg.password.insert(0, "secret")
-    dlg.port.delete(0, tk.END)
-    dlg.port.insert(0, "not-a-port")
-    assert dlg.validate() is False
-    assert shown, "expected a warning about the invalid port"
-    dlg._on_cancel()
 
 
 def test_user_properties_dialog_diff(root):
@@ -1268,3 +1239,388 @@ def test_ad_tab_always_enabled_when_both_roles_missing(root, patched_clients,
     assert all(str(b["state"]) == "normal" for b in app.ad_toolbar_buttons)
     assert str(app.info_refresh_btn["state"]) == "normal"
     assert app.ad_tree.exists("DC=example,DC=local")
+
+
+# -- v1.8.5: review fixes ------------------------------------------------------
+
+def test_disconnect_clears_password_field(root, patched_clients):
+    """Disconnect wipes the password from the entry field and its
+    StringVar (v1.8.5), not just the credential store."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.password_var.get() == "secret"
+    assert app.password_entry.get() == "secret"
+    app._global_disconnect()
+    root.update_idletasks()
+    assert app.password_var.get() == ""
+    assert app.password_entry.get() == ""
+    assert app.creds.password is None
+
+
+def test_dhcp_server_switch_updates_label(root, patched_clients):
+    """Switching the DHCP server picker updates the 'Managing DHCP
+    on ...' label (v1.8.5)."""
+    app = MSATApp(root)
+    _connect_app(app, "dc3")  # dc3 has no DHCP: the picker shows dc1/dc2
+    root.update_idletasks()
+    assert "Managing DHCP on dc1." in app.dhcp_note["text"]
+    app.dhcp_server_var.set("dc2")
+    app._dhcp_on_server_change()
+    root.update_idletasks()
+    assert app._dhcp_server == "dc2"
+    assert "Managing DHCP on dc2." in app.dhcp_note["text"]
+
+
+def test_role_gating_disables_search_clear_buttons(root, patched_clients,
+                                                   monkeypatch):
+    """When a role is missing, the tab's search entry AND its clear
+    (×) button are disabled (v1.8.5)."""
+    monkeypatch.setattr(
+        "msat.app.detect_server_roles",
+        lambda client: {"DNS": False, "DHCP": False})
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert str(app._dns_search_entry["state"]) == "disabled"
+    assert str(app._dns_search_clear_btn["state"]) == "disabled"
+    assert str(app._dhcp_search_entry["state"]) == "disabled"
+    assert str(app._dhcp_search_clear_btn["state"]) == "disabled"
+    # The AD search row is unaffected (AD is always enabled).
+    assert str(app._search_entries[0]["state"]) == "normal"
+    assert str(app._search_clear_btns[0]["state"]) == "normal"
+
+
+def test_dhcp_discovery_short_circuits_when_connected_server_has_dhcp(
+        root, patched_clients, monkeypatch):
+    """When the connected server has the DHCP role, the other
+    configured servers are not probed (v1.8.5)."""
+    calls = []
+
+    def counting_roles(client):
+        calls.append(getattr(client, "host", None))
+        if getattr(client, "host", None) == "dc3":
+            return {"DNS": True, "DHCP": False}
+        return {"DNS": True, "DHCP": True}
+
+    monkeypatch.setattr("msat.app.detect_server_roles", counting_roles)
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert calls == ["dc1"]
+
+
+def test_dhcp_discovery_probes_other_servers_when_connected_server_lacks_dhcp(
+        root, patched_clients, monkeypatch):
+    """When the connected server has no DHCP role, the other
+    configured servers are probed in order (v1.8.5)."""
+    calls = []
+
+    def counting_roles(client):
+        calls.append(getattr(client, "host", None))
+        if getattr(client, "host", None) == "dc3":
+            return {"DNS": True, "DHCP": False}
+        return {"DNS": True, "DHCP": True}
+
+    monkeypatch.setattr("msat.app.detect_server_roles", counting_roles)
+    app = MSATApp(root)
+    _connect_app(app, "dc3")
+    root.update_idletasks()
+    assert calls == ["dc3", "dc1", "dc2"]
+
+
+def test_tree_select_runs_one_list_children_query(root, patched_clients):
+    """Clicking a tree node runs list_children once for that DN
+    (v1.8.5): the old code ran it twice (list view + tree children)."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    root_dn = "DC=example,DC=local"
+    assert app.ad_tree.exists(root_dn + "__loading__")
+    calls = []
+    orig = app.ad_client.list_children
+
+    def counting(dn):
+        calls.append(dn)
+        return orig(dn)
+
+    app.ad_client.list_children = counting
+    app.ad_tree.selection_set(root_dn)
+    app._ad_on_tree_select(None)
+    assert calls == [root_dn]
+
+
+def test_dhcp_refresh_scope_reloads_with_filter_active(root, patched_clients):
+    """After an add/edit/remove, the scope reloads even when a search
+    filter is active (v1.8.5): the filter rebuilds the scopes tree
+    and wipes the selection, which used to make the post-change
+    refresh a no-op and leave the lists stale."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    scopes = [{"ScopeId": "192.168.1.0", "Name": "Office",
+               "SubnetMask": "255.255.255.0", "State": "Active",
+               "StartRange": "192.168.1.10", "EndRange": "192.168.1.200",
+               "LeaseDuration": "1.00:00:00"}]
+    leases = [{"IPAddress": "192.168.1.10", "HostName": "PC-01",
+               "ClientId": "00-11-22-33-44-55", "AddressState": "Active",
+               "LeaseExpiryTime": "2026-11-14T10:00:00",
+               "ClientType": "DHCP"}]
+    reservations = [{"IPAddress": "192.168.1.50", "Name": "Printer",
+                     "ClientId": "AA-BB-CC-DD-EE-FF",
+                     "Description": "Front printer", "Type": "DHCP"}]
+    calls = {"leases": 0, "reservations": 0}
+
+    def list_leases(scope_id):
+        calls["leases"] += 1
+        return list(leases)
+
+    def list_reservations(scope_id):
+        calls["reservations"] += 1
+        return list(reservations)
+
+    app.dhcp.list_scopes = lambda: list(scopes)
+    app.dhcp.list_leases = list_leases
+    app.dhcp.list_reservations = list_reservations
+    app._dhcp_refresh()
+    root.update_idletasks()
+    assert len(app.dhcp_scopes.get_children()) == 1
+    app.dhcp_scopes.selection_set(app.dhcp_scopes.get_children()[0])
+    app._dhcp_on_scope_select(None)
+    assert app._dhcp_current_scope == "192.168.1.0"
+    assert len(app.dhcp_leases.get_children()) == 1
+    assert len(app.dhcp_reservations.get_children()) == 1
+    # A search filter rebuilds the scopes tree and wipes the selection.
+    app._dhcp_search_var.set("office")
+    app._dhcp_apply_filter()
+    assert app.dhcp_scopes.selection() == ()
+    # The post-change refresh (what add/edit/remove now call) still
+    # reloads the scope's leases and reservations — the canonical
+    # rows prove it, even though the active filter hides rows that
+    # do not match "office" (correct: the filter still applies).
+    calls["leases"] = 0
+    calls["reservations"] = 0
+    app._dhcp_refresh_scope(app._dhcp_current_scope)
+    assert calls["leases"] == 1
+    assert calls["reservations"] == 1
+    assert len(app._dhcp_leases_rows) == 1
+    assert len(app._dhcp_reservations_rows) == 1
+    # Clearing the filter shows the reloaded rows in the trees.
+    app._dhcp_search_var.set("")
+    app._dhcp_apply_filter()
+    assert len(app.dhcp_leases.get_children()) == 1
+    assert len(app.dhcp_reservations.get_children()) == 1
+
+
+def test_dns_refresh_zone_reloads_with_filter_active(root, patched_clients):
+    """After an add/edit/remove, the zone reloads even when a search
+    filter is active (v1.8.5): the filter rebuilds the zones tree and
+    wipes the selection, which used to make the post-change refresh
+    a no-op and leave the records stale."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    zones = [{"ZoneName": "example.local", "ZoneType": "Primary",
+              "IsDsIntegrated": True, "IsReverseLookupZone": False,
+              "DynamicUpdate": "Secure"}]
+    records = [{"HostName": "dc1", "RecordType": "A", "TimeStamp": None,
+                "TTL": 3600.0, "Data": "192.168.1.10",
+                "RemoveData": "192.168.1.10"}]
+    calls = {"records": 0}
+
+    def list_records(zone):
+        calls["records"] += 1
+        return list(records)
+
+    app.dns.list_zones = lambda: list(zones)
+    app.dns.list_records = list_records
+    app._dns_refresh()
+    root.update_idletasks()
+    assert len(app.dns_zones.get_children()) == 1
+    app.dns_zones.selection_set(app.dns_zones.get_children()[0])
+    app._dns_on_zone_select(None)
+    assert app._dns_current_zone == "example.local"
+    assert len(app.dns_records.get_children()) == 1
+    app._dns_search_var.set("example")
+    app._dns_apply_filter()
+    assert app.dns_zones.selection() == ()
+    # The post-change refresh (what add/edit/remove now call) still
+    # reloads the zone's records — the canonical rows prove it, even
+    # though the active filter hides rows that do not match
+    # "example" (correct: the filter still applies).
+    calls["records"] = 0
+    app._dns_refresh_zone(app._dns_current_zone)
+    assert calls["records"] == 1
+    assert len(app._dns_records_rows) == 1
+    # Clearing the filter shows the reloaded rows in the tree.
+    app._dns_search_var.set("")
+    app._dns_apply_filter()
+    assert len(app.dns_records.get_children()) == 1
+
+
+def test_new_user_passes_must_change_without_second_password_write(
+        root, patched_clients, monkeypatch):
+    """_ad_new_user passes must_change into create_user (v1.8.5) and
+    does not call reset_password a second time."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    created = {}
+    reset_calls = []
+
+    class _SpyAD(FakeADClient):
+        def create_user(self, ou_dn, sam, given="", sn="", display_name="",
+                        password=None, upn=None, user_account_control=512,
+                        must_change=False):
+            created["must_change"] = must_change
+            created["sam"] = sam
+            return "CN={},{}".format(display_name or sam, ou_dn)
+
+        def reset_password(self, dn, new_password, must_change=False):
+            reset_calls.append((dn, new_password, must_change))
+
+    app.ad_client = _SpyAD()
+    app._ad_current_dn = "DC=example,DC=local"
+
+    class _FakeDialog:
+        def __init__(self, parent, ou_dn):
+            self.result = {"ou": "OU=Users,DC=example,DC=local",
+                           "sam": "jdoe", "given": "John", "sn": "Doe",
+                           "display": "John Doe", "password": "Temp1234!",
+                           "must_change": True}
+
+        def wait_window(self):
+            return None
+
+    monkeypatch.setattr("msat.app.dialogs.NewUserDialog", _FakeDialog)
+    app._ad_refresh = lambda: None
+    app._ad_new_user()
+    assert created["must_change"] is True
+    assert created["sam"] == "jdoe"
+    assert reset_calls == []
+
+
+def test_search_filter_is_debounced(root, patched_clients):
+    """Typing in a search box does not filter immediately (v1.8.5):
+    the filter runs ~150 ms after the last keystroke."""
+    import time
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app._ad_rows = [
+        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+         "type": "user", "description": "Analyst", "status": "Enabled"},
+        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+         "type": "user", "description": "Manager", "status": "Enabled"},
+    ]
+    app._ad_apply_filter()
+    assert len(app.ad_list.get_children()) == 2
+    entry = app._search_entries[0]  # AD search entry
+    # Focus the entry first: a real keystroke goes to the focused
+    # widget, and a synthetic KeyRelease is only delivered to the
+    # entry when it has focus. focus_force() (not focus_set()) is
+    # needed under xvfb, where the window manager does not grant
+    # focus to the test window on its own.
+    entry.focus_force()
+    app._ad_search_var.set("john")
+    entry.event_generate("<KeyRelease>", keysym="n")
+    root.update()
+    # Not yet filtered — the debounce has not fired.
+    assert len(app.ad_list.get_children()) == 2
+    time.sleep(0.25)
+    root.update()
+    assert len(app.ad_list.get_children()) == 1
+
+
+def test_edit_record_dialog_empty_ttl_does_not_raise(root):
+    """An empty TTL in the record does not crash EditRecordDialog
+    (v1.8.5): int(float('')) used to raise ValueError."""
+    from msat.dialogs import EditRecordDialog
+    dlg = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": "",
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    try:
+        assert dlg.ttl.get() == ""
+    finally:
+        dlg._on_cancel()
+
+
+def test_edit_record_dialog_non_numeric_ttl_shows_empty(root):
+    """A non-numeric TTL shows an empty TTL field, not a crash."""
+    from msat.dialogs import EditRecordDialog
+    dlg = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": "not-a-number",
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    try:
+        assert dlg.ttl.get() == ""
+    finally:
+        dlg._on_cancel()
+
+
+def test_edit_record_dialog_float_ttl_shows_integer(root):
+    """A float TTL (e.g. 3600.0 from the JSON) shows as an integer."""
+    from msat.dialogs import EditRecordDialog
+    dlg = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": 3600.0,
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    try:
+        assert dlg.ttl.get() == "3600"
+    finally:
+        dlg._on_cancel()
+
+
+def test_record_dialogs_reject_negative_ttl(root, monkeypatch):
+    """A negative TTL is rejected by both record dialogs (v1.8.5)."""
+    from msat.dialogs import AddRecordDialog, EditRecordDialog
+    shown = []
+    monkeypatch.setattr("msat.dialogs.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    add = AddRecordDialog(root, "example.local")
+    try:
+        add.name.insert(0, "pc01")
+        add.data.insert(0, "192.168.1.10")
+        add.ttl.insert(0, "-5")
+        assert add.validate() is False
+        assert shown, "expected a warning about the negative TTL"
+    finally:
+        add._on_cancel()
+    shown.clear()
+    edit = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": 3600.0,
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    try:
+        edit.ttl.delete(0, tk.END)
+        edit.ttl.insert(0, "-5")
+        assert edit.validate() is False
+        assert shown, "expected a warning about the negative TTL"
+    finally:
+        edit._on_cancel()
+    # Zero is a valid TTL (no caching) and is accepted.
+    shown.clear()
+    edit2 = EditRecordDialog(root, "example.local", {
+        "HostName": "dc1", "RecordType": "A", "TTL": 3600.0,
+        "Data": "192.168.1.10", "RemoveData": "192.168.1.10"})
+    try:
+        edit2.ttl.delete(0, tk.END)
+        edit2.ttl.insert(0, "0")
+        assert edit2.validate() is True
+    finally:
+        edit2._on_cancel()
+
+
+def test_info_refresh_lists_all_naming_contexts(root, patched_clients):
+    """Directory Info shows every naming context (v1.8.5): the old
+    get_root_dse collapsed the list to its first element."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    app.ad_client.get_root_dse = lambda: {
+        "defaultNamingContext": "DC=example,DC=local",
+        "namingContexts": ["DC=example,DC=local",
+                           "CN=Configuration,DC=example,DC=local",
+                           "CN=Schema,CN=Configuration,DC=example,DC=local"]}
+    app._info_refresh()
+    text = app.info_text.get("1.0", tk.END)
+    assert ("Naming contexts: DC=example,DC=local, "
+            "CN=Configuration,DC=example,DC=local, "
+            "CN=Schema,CN=Configuration,DC=example,DC=local") in text

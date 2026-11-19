@@ -124,7 +124,9 @@ class DHCPManager:
         return True
 
     def update_reservation(self, scope_id, old_mac_address, ip_address,
-                           mac_address, name, description=None):
+                           mac_address, name, description=None,
+                           old_ip_address=None, old_name=None,
+                           old_description=None):
         """Update a reservation, identified by ScopeId + ClientId (MAC).
 
         IPAddress, Name and Description are changed in place with
@@ -134,13 +136,40 @@ class DHCPManager:
         the reservation is removed and re-created with the new MAC.
         Returns "updated" or "recreated" so the UI can say which
         happened.
+
+        The new values are validated BEFORE the old reservation is
+        removed, so a bad new IP or MAC cannot delete the reservation
+        and then fail to re-create it. If the re-create still fails
+        server-side (e.g. an IP conflict the client cannot see) and
+        the caller passed the old values (``old_ip_address``,
+        ``old_name``, ``old_description``), the old reservation is
+        re-added — a best-effort rollback — and the original error
+        is raised, noting whether the restore succeeded.
         """
         old_mac = normalize_mac(old_mac_address)
         new_mac = normalize_mac(mac_address)
+        # Validate everything new BEFORE touching the old reservation.
+        validate_ipv4(scope_id)
+        validate_ipv4(ip_address)
         if new_mac != old_mac:
             self.remove_reservation(scope_id, old_mac)
-            self.add_reservation(scope_id, ip_address, new_mac, name,
-                                 description)
+            try:
+                self.add_reservation(scope_id, ip_address, new_mac, name,
+                                     description)
+            except Exception as exc:
+                if old_ip_address is None:
+                    raise
+                try:
+                    self.add_reservation(scope_id, old_ip_address,
+                                         old_mac, old_name, old_description)
+                except Exception as rollback_exc:
+                    raise WinRMError(
+                        "Update DHCP reservation failed: {}. The old "
+                        "reservation could NOT be restored: {}".format(
+                            exc, rollback_exc)) from exc
+                raise WinRMError(
+                    "Update DHCP reservation failed: {}. The old "
+                    "reservation was restored.".format(exc)) from exc
             return "recreated"
         parts = [
             "Set-DhcpServerv4Reservation",

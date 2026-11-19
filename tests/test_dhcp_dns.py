@@ -65,6 +65,19 @@ def test_validate_ipv4():
             validate_ipv4(bad)
 
 
+def test_validate_ipv6_rejects_ipv4():
+    """validate_ipv6 accepts only IPv6 (v1.8.5): the old code used
+    ipaddress.ip_address(), which also accepts IPv4, so an IPv4
+    address passed client validation when editing an AAAA record
+    and only failed server-side."""
+    from msat.dns import validate_ipv6
+    assert validate_ipv6("2001:db8::1") == "2001:db8::1"
+    assert validate_ipv6("::1") == "::1"
+    for bad in ("192.168.1.10", "999.1.1.1", "not-an-ip", "2001:db8:::1"):
+        with pytest.raises(ValueError):
+            validate_ipv6(bad)
+
+
 # -- DHCP -----------------------------------------------------------------------
 
 def test_dhcp_list_scopes(fake_winrm):
@@ -281,3 +294,82 @@ def test_dhcp_update_reservation_validates_input(fake_winrm):
     with pytest.raises(ValueError):
         mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
                                "192.168.1.60", "bad-mac", "X")
+
+
+def test_dhcp_update_reservation_mac_change_validates_before_remove(
+        fake_winrm):
+    """A MAC change validates the new values BEFORE removing the old
+    reservation (v1.8.5): the old code removed first, so a bad new
+    IP deleted the reservation and then failed to re-create it."""
+    mgr = DHCPManager(fake_winrm)
+    with pytest.raises(ValueError):
+        mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
+                               "999.1.1.1", "11:22:33:44:55:66", "X")
+    # Nothing was sent to the server at all — no remove happened.
+    assert fake_winrm.scripts == []
+    with pytest.raises(ValueError):
+        mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
+                               "192.168.1.60", "bad-mac", "X")
+    assert fake_winrm.scripts == []
+
+
+def test_dhcp_update_reservation_mac_change_rollback_restores_old(
+        fake_winrm):
+    """When the re-create fails server-side, the old reservation is
+    re-added (v1.8.5) and the original error is raised."""
+    from msat.winrm_client import WinRMError
+    # Fail only the re-create (it carries the new IP); the remove
+    # and the rollback re-add (old IP) succeed.
+    fake_winrm.when_error("192.168.1.60", "IP address is already in use")
+    mgr = DHCPManager(fake_winrm)
+    with pytest.raises(WinRMError) as excinfo:
+        mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
+                               "192.168.1.60", "11:22:33:44:55:66",
+                               "Printer 2", "Moved printer",
+                               old_ip_address="192.168.1.50",
+                               old_name="Printer",
+                               old_description="Front printer")
+    assert "restored" in str(excinfo.value)
+    assert len(fake_winrm.scripts) == 3
+    assert "Remove-DhcpServerv4Reservation" in fake_winrm.scripts[0]
+    assert "Add-DhcpServerv4Reservation" in fake_winrm.scripts[1]
+    assert "'192.168.1.60'" in fake_winrm.scripts[1]
+    # The rollback re-adds the OLD reservation.
+    assert "Add-DhcpServerv4Reservation" in fake_winrm.scripts[2]
+    assert "'192.168.1.50'" in fake_winrm.scripts[2]
+    assert "'AA-BB-CC-DD-EE-FF'" in fake_winrm.scripts[2]
+    assert "'Printer'" in fake_winrm.scripts[2]
+
+
+def test_dhcp_update_reservation_mac_change_rollback_failure_reported(
+        fake_winrm):
+    """When the re-create AND the rollback both fail, the error says
+    the old reservation could not be restored (v1.8.5)."""
+    from msat.winrm_client import WinRMError
+    fake_winrm.when_error("Add-DhcpServerv4Reservation", "server error")
+    mgr = DHCPManager(fake_winrm)
+    with pytest.raises(WinRMError) as excinfo:
+        mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
+                               "192.168.1.60", "11:22:33:44:55:66",
+                               "Printer 2", "Moved printer",
+                               old_ip_address="192.168.1.50",
+                               old_name="Printer",
+                               old_description="Front printer")
+    assert "could NOT be restored" in str(excinfo.value)
+    # Remove + failed re-create + failed rollback attempt.
+    assert len(fake_winrm.scripts) == 3
+
+
+def test_dhcp_update_reservation_mac_change_no_old_values_no_rollback(
+        fake_winrm):
+    """Without the old values, a failed re-create just raises (the
+    caller that has them — the UI — always passes them)."""
+    from msat.winrm_client import WinRMError
+    fake_winrm.when_error("192.168.1.60", "IP address is already in use")
+    mgr = DHCPManager(fake_winrm)
+    with pytest.raises(WinRMError):
+        mgr.update_reservation("192.168.1.0", "AA-BB-CC-DD-EE-FF",
+                               "192.168.1.60", "11:22:33:44:55:66",
+                               "Printer 2", "Moved printer")
+    # Remove + failed re-create; no rollback attempted (no old values).
+    assert len(fake_winrm.scripts) == 2

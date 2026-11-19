@@ -75,3 +75,51 @@ def test_run_ps_json_failing_command_raises():
     client = WinRMClient("dc1", "u", "p", session=session)
     with pytest.raises(WinRMError):
         client.run_ps_json("Get-Nope | ConvertTo-Json", "List things")
+
+
+# -- detect_server_roles -----------------------------------------------------
+
+class _FakeRoleClient:
+    """Stand-in for WinRMClient.run_ps_json for role detection."""
+
+    def __init__(self, service_rows=None, feature_rows=None, fail_services=False):
+        self.service_rows = service_rows
+        self.feature_rows = feature_rows
+        self.fail_services = fail_services
+        self.calls = []
+
+    def run_ps_json(self, script, what="PowerShell command"):
+        self.calls.append(script)
+        if "Get-Service" in script:
+            if self.fail_services:
+                raise WinRMError("Get-Service failed")
+            return self.service_rows or []
+        if "Get-WindowsFeature" in script:
+            return self.feature_rows or []
+        raise WinRMError("unexpected script")
+
+
+def test_detect_server_roles_case_insensitive_service_names():
+    """The Get-Service path normalizes names to uppercase (v1.8.5):
+    a service reported as 'dhcpserver' or 'DhcpServer' still counts
+    as the DHCP role, matching the Get-WindowsFeature fallback."""
+    from msat.winrm_client import detect_server_roles
+    client = _FakeRoleClient(service_rows=[{"Name": "dns"},
+                                           {"Name": "DhcpServer"}])
+    assert detect_server_roles(client) == {"DNS": True, "DHCP": True}
+    client = _FakeRoleClient(service_rows=[{"Name": "DNS"},
+                                           {"Name": "dhcpserver"}])
+    assert detect_server_roles(client) == {"DNS": True, "DHCP": True}
+    client = _FakeRoleClient(service_rows=[{"Name": "DNS"}])
+    assert detect_server_roles(client) == {"DNS": True, "DHCP": False}
+
+
+def test_detect_server_roles_falls_back_to_windows_feature():
+    """When Get-Service fails, Get-WindowsFeature is used instead."""
+    from msat.winrm_client import detect_server_roles
+    client = _FakeRoleClient(
+        feature_rows=[{"Name": "dns", "Installed": True},
+                      {"Name": "dhcp", "Installed": False}],
+        fail_services=True)
+    assert detect_server_roles(client) == {"DNS": True, "DHCP": False}
+    assert any("Get-WindowsFeature" in call for call in client.calls)

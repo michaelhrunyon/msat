@@ -12,4 +12,9 @@ Credentials are collected at connection time, held in memory only, and
 never written to disk (see :mod:`msat.credentials`).
 """
 
-__version__ = "0.1.0"
+from .constants import APP_VERSION
+
+# Single source of truth: the version lives in constants.py (and is
+# mirrored in msat.spec for the .app bundle); __init__ re-exports it
+# rather than carrying its own number.
+__version__ = APP_VERSION

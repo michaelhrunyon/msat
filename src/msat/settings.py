@@ -31,16 +31,12 @@ from .constants import (DEFAULT_DOMAIN, DEFAULT_SERVER, SERVERS)
 
 # The only fields settings may contain. Anything else — in
 # particular any credential, or a stale per-role server list — is
-# dropped on save and ignored on load.
+# dropped on save and ignored on load. The whitelist in
+# :func:`save_settings` is the guard that keeps credentials out of
+# the file; there is no separate forbidden-keys list (one was tried
+# and never consulted, so it was removed rather than left as a
+# misleading second guard).
 SETTINGS_KEYS = ("domain", "servers", "default_server")
-
-# Keys that must never be persisted, even if a caller passes them in.
-# (The whitelist above already excludes them; this is a second,
-# explicit guard so a credential can never slip into the file.)
-_FORBIDDEN_KEYS = frozenset({
-    "username", "user", "password", "passwd", "pass", "credential",
-    "credentials", "token", "secret", "api_key", "apikey", "private_key",
-})
 
 # Keys from older settings files that named a per-role server list.
 # On load, ``dc_servers`` is translated to ``servers`` when ``servers``

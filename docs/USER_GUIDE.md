@@ -43,7 +43,9 @@ on the connected server; DHCP is on when any configured server
 has the DHCP Server role — the DHCP tab manages the first one
 found (connected server first, then the other configured servers
 in order), and if the connected server has no DHCP role, a picker
-lets you choose among the servers that do. A tab whose role is
+lets you choose among the servers that do. When the connected
+server already has the DHCP role, the other servers are not
+checked at all, so connecting is faster. A tab whose role is
 missing is gated: its tools are disabled and a note names the
 server and the missing role; its **Refresh** button stays enabled,
 so installing the role and clicking Refresh enables the tab.
@@ -63,8 +65,10 @@ failure is reported in the status bar at the bottom and the other
 tabs still work. Retry that tab later with its own **Refresh**
 button, where a failure does show the error.
 
-Click **Disconnect** when you are done — it disconnects everything
-and wipes the stored credentials. Closing the app wipes them too.
+Click **Disconnect** when you are done — it disconnects everything,
+wipes the stored credentials, and clears the password field, so
+nothing is left sitting in the connection bar. Closing the app
+wipes them too.
 
 If a connection fails, the app shows the error (wrong password, server
 unreachable, WinRM not enabled, …) — check the server name, the port,
@@ -144,7 +148,9 @@ folder and outside the app bundle.
   (case-insensitive, matches Name, Type, Description, Status or
   Locked). Clearing it shows everything again. It does not run a
   new search against the server. The small **×** button beside the
-  box clears the search text and restores the full list.
+  box clears the search text and restores the full list. The
+  filter waits a short moment after you stop typing before
+  rebuilding the list, so typing stays smooth in large containers.
 - **Properties:** double-click a user or a group (or select one and
   click **Properties**) to open its properties. For a user, the
   **General** tab edits the common attributes (display name,
@@ -195,7 +201,10 @@ folder and outside the app bundle.
   leases and reservations as you type (case-insensitive, matches
   any visible column). Clearing it shows everything again. The
   small **×** button beside the box clears the search text and
-  restores the full list.
+  restores the full list. The filter waits a short moment after you
+  stop typing before rebuilding the list, so typing stays smooth
+  in large scopes. Adding, editing or removing a reservation
+  refreshes that scope even while a search filter is active.
 - **Select a scope** to see its leases (left) and reservations (right).
 - **Add Reservation:** needs a scope selected. Enter the IP, the MAC
   address (colons, dashes or plain hex all work), a name, and an
@@ -203,7 +212,9 @@ folder and outside the app bundle.
 - **Edit Reservation:** select a reservation and click **Edit
   Reservation** (or double-click it) to change its IP address, name
   or description in place. Changing the MAC recreates the
-  reservation (remove + re-add); the dialog says so.
+  reservation (remove + re-add); the dialog says so. The IP and
+  MAC are checked before anything is removed, and if the re-add
+  fails the old reservation is restored.
 - **Remove Reservation:** select a reservation, confirm, and it is
   deleted.
 - **Superscopes:** shows the superscopes on the server and the scopes
@@ -220,13 +231,17 @@ folder and outside the app bundle.
   records as you type (case-insensitive, matches any visible
   column). Clearing it shows everything again. The small **×**
   button beside the box clears the search text and restores the
-  full list.
+  full list. The filter waits a short moment after you stop typing
+  before rebuilding the list, so typing stays smooth in large
+  zones. Adding, editing or removing a record refreshes that zone
+  even while a search filter is active.
 - **Select a zone** to see its records (hostname, type, data, TTL).
 - **Add Record:** choose the type — A (IPv4), CNAME (alias), PTR
   (reverse), MX (mail). For the zone apex use `@` as the record name.
   For PTR records, select the reverse zone (e.g.
   `1.168.192.in-addr.arpa`) and enter the last octet as the name.
-  TTL is optional (leave blank for the zone default).
+  TTL is optional (leave blank for the zone default). A negative
+  TTL is rejected.
 - **Edit Record:** select a record and click **Edit Record** (or
   double-click it) to change its data and TTL in place — A, AAAA,
   CNAME, PTR, MX and TXT. The record name and type are the identity
@@ -240,6 +255,7 @@ folder and outside the app bundle.
 Read-only. Once connected it shows:
 
 - **Forest / Domain:** naming contexts, functional levels, server.
+  All naming contexts are shown.
 - **Sites & Subnets:** AD sites with their subnets underneath.
 - **Trusted Domains:** domain trusts and their direction.
 
