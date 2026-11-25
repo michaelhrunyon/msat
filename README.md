@@ -300,9 +300,9 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.10** — tested against a live Active Directory environment (3 DCs). 249 tests passing.
+**v1.8.11** — tested against a live Active Directory environment (3 DCs). 250 tests passing.
 
-- **Timeout disconnect now clears everything:** when the DC closes the connection (idle timeout / dropped), the app returns to the login screen and clears all shown data — AD, DHCP, DNS and Directory Info — and wipes the password, exactly like clicking Disconnect. Previously the Directory Info refresh noted a dead connection inline and left the data visible.
+- **Timeout disconnect, no popup:** when the DC closes the connection, the app now clears all shown data and returns to the login screen at once — no modal popup. The notice is the status bar, highlighted with a subtle amber background so it draws the eye, and the cursor lands in the password field so you can just type the password and reconnect.
 
 ## Known limitations
 

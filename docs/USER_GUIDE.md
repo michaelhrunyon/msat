@@ -35,14 +35,15 @@ gray and **Disconnect** is blue instead. If the connection fails,
 both return to gray.
 
 **If the connection drops** (the DC closes it after a period of
-inactivity, v1.8.9): the next operation says plainly that the
-connection was closed and returns the app to the login screen —
-just click **Connect** again. The app no longer shows the raw
-"Broken pipe" error and leaves itself looking connected. A
-timeout disconnect clears all shown data — AD, DHCP, DNS and
-Directory Info — and wipes the password, exactly like clicking
-**Disconnect** (v1.8.10), so no directory data is left visible on
-an unattended workstation.
+inactivity, v1.8.9): the app disconnects at once and clears all
+shown data — AD, DHCP, DNS and Directory Info — and wipes the
+password, exactly like clicking **Disconnect** (v1.8.10), so no
+directory data is left visible on an unattended workstation.
+There is no popup (v1.8.11): the notice is the status bar, which
+is highlighted with a subtle amber background so it draws the eye,
+and the cursor lands in the password field so you can just type
+the password and reconnect. The app no longer shows the raw
+"Broken pipe" error.
 
 **Role detection.** Once the credentials check out, the app
 examines the installed roles on the connected server (over WinRM)

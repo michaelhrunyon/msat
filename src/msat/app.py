@@ -130,6 +130,7 @@ class MSATApp:
 
         self.statusbar = ttk.Label(root, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
         self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._init_status_highlight()
         self._build_menu()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -749,8 +750,35 @@ class MSATApp:
 
     # -- shared helpers ------------------------------------------------------
 
-    def set_status(self, message):
+    def _init_status_highlight(self):
+        """Define the "Important.TLabel" style for the status bar.
+
+        An important notification (e.g. a dropped connection) gets a
+        subtle amber background so it draws the eye, without being
+        glaring. Theme-aware: a dark warm amber on a dark bar, a
+        light warm amber on a light bar, so the text stays readable
+        either way. Falls back to the dark amber.
+        """
+        try:
+            bg = ttk.Style().lookup("TLabel", "background") or ""
+            r, g, b = self.root.winfo_rgb(bg)
+            # winfo_rgb returns 16-bit values.
+            luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 65535.0
+        except Exception:  # noqa: BLE001 - fall back to dark amber
+            luminance = 0.0
+        highlight = "#5C4A1A" if luminance < 0.5 else "#FFF3CD"
+        ttk.Style().configure("Important.TLabel", background=highlight)
+
+    def set_status(self, message, important=False):
+        """Set the status bar text.
+
+        ``important`` highlights the bar with a subtle amber
+        background so an important notification draws the eye; a
+        normal message reverts to the plain bar.
+        """
         self.statusbar.config(text=message)
+        self.statusbar.config(
+            style="Important.TLabel" if important else "TLabel")
 
     def _error(self, exc):
         # A dead LDAP connection is not just an error to report: the
@@ -766,23 +794,23 @@ class MSATApp:
     def _ad_connection_lost(self, exc):
         """The DC closed the LDAP connection (idle timeout / dropped).
 
-        The old behaviour showed the raw socket error ("LDAP search
-        failed: socket sending error[Errno 32] Broken pipe") and left
-        the app looking connected, so the next operation failed the
-        same way. Instead, say plainly that the connection was
-        closed and return to the login-ready state — the user just
-        hits Connect again.
+        Disconnect and clear every tab the moment the timeout is
+        detected — the same blank canvas as clicking Disconnect —
+        and put the focus in the password field so the user can just
+        type the password and reconnect. No modal popup: the notice
+        is the status bar, highlighted so it draws the eye. The old
+        popup left the data visible behind it until it was dismissed
+        (the disconnect ran first, but the redraw only happened
+        after the modal closed), which is exactly the window an
+        unattended workstation must not have.
         """
         self._global_disconnect()
-        messagebox.showwarning(
-            "Connection closed",
-            "The connection to the domain controller was closed "
-            "(it timed out or was dropped).\n\n"
-            "You have been returned to the login screen — "
-            "click Connect to sign in again.",
-            parent=self.root)
+        # Redraw now, so the data is gone at once — without this the
+        # clears sit queued until the event loop next runs.
+        self.root.update_idletasks()
         self.set_status("Connection to the domain controller was closed. "
-                        "Please reconnect.")
+                        "Please reconnect.", important=True)
+        self.password_entry.focus_set()
 
     def _fail_connect(self, title, message, status_message):
         """Leave the app cleanly disconnected and say why.

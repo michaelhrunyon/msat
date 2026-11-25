@@ -636,11 +636,13 @@ def test_ad_search_result_click_on_container_moves_into_it(root, patched_clients
 
 
 def test_connection_lost_during_search_returns_to_login(root, patched_clients, monkeypatch):
-    """A dead DC connection during a search (v1.8.9): instead of the
-    raw "LDAP search failed: socket sending error[Errno 32] Broken
-    pipe" dialog with the app left looking connected, the app says
-    plainly the connection was closed and returns to the login-ready
-    state (disconnected, Connect available, trees cleared)."""
+    """A dead DC connection during a search (v1.8.9, popup removed in
+    v1.8.11): instead of the raw "LDAP search failed: socket sending
+    error[Errno 32] Broken pipe" dialog with the app left looking
+    connected, the app disconnects at once — no modal at all. The
+    notice is the status bar, highlighted; the data is cleared and
+    the focus lands in the password field so the user can just type
+    the password and reconnect."""
     from msat.ldap_client import ADConnectionLostError
     shown = []
     monkeypatch.setattr("msat.app.messagebox.showwarning",
@@ -657,28 +659,36 @@ def test_connection_lost_during_search_returns_to_login(root, patched_clients, m
             "The connection to the domain controller was closed "
             "(it timed out or was dropped). Please reconnect.")
     app.ad_client.search_objects = dead_search
+    # Record the focus_set() call (focus_get() is None under xvfb).
+    focused = []
+    orig_focus_set = app.password_entry.focus_set
+    app.password_entry.focus_set = lambda: (
+        focused.append(True), orig_focus_set())
     app._ad_search_var.set("doe")
     app._ad_apply_filter()
     root.update_idletasks()
-    # Returned to the login-ready state.
+    # Returned to the login-ready state, with no modal popup.
     assert app.ad_client is None
+    assert shown == [], "no popup expected — the notice is the status bar"
     assert len(app.ad_list.get_children()) == 0
     assert len(app.ad_tree.get_children()) == 0
-    # The message says the connection was closed (not "Broken pipe").
-    assert shown, "expected a connection-closed message"
-    text = " ".join(str(a) for a in shown[0])
-    assert "closed" in text.lower()
-    assert "Broken pipe" not in text
-    assert "timed out" in text.lower() or "dropped" in text.lower()
-    # The status bar says the same, and Connect is usable again.
+    # The status bar says the connection was closed (not "Broken pipe")
+    # and is highlighted so it draws the eye.
     assert "closed" in app.statusbar["text"].lower()
+    assert "Broken pipe" not in app.statusbar["text"]
+    assert app.statusbar.cget("style") == "Important.TLabel"
     assert str(app.connect_btn["state"]) == "normal"
+    # Focus is requested in the password field, ready to reconnect.
+    # (focus_get() is None under xvfb — the window has no window-
+    # manager focus there — so record the focus_set() call itself.)
+    assert focused == [True]
 
 
 def test_connection_lost_during_list_load_returns_to_login(root, patched_clients, monkeypatch):
     """The same handling for a dead connection hit while loading a
     container's children (the path the v1.8.8 "Broken pipe" dialog
-    came from)."""
+    came from) — no modal, status bar highlighted, focus in the
+    password field."""
     from msat.ldap_client import ADConnectionLostError
     shown = []
     monkeypatch.setattr("msat.app.messagebox.showwarning",
@@ -695,13 +705,18 @@ def test_connection_lost_during_list_load_returns_to_login(root, patched_clients
             "The connection to the domain controller was closed "
             "(it timed out or was dropped). Please reconnect.")
     app.ad_client.list_children = dead_list
+    # Record the focus_set() call (focus_get() is None under xvfb).
+    focused = []
+    orig_focus_set = app.password_entry.focus_set
+    app.password_entry.focus_set = lambda: (
+        focused.append(True), orig_focus_set())
     app._ad_refresh_list("DC=example,DC=local")
     root.update_idletasks()
     assert app.ad_client is None
-    assert shown, "expected a connection-closed message"
-    text = " ".join(str(a) for a in shown[0])
-    assert "Broken pipe" not in text
-    assert "closed" in text.lower()
+    assert shown == [], "no popup expected — the notice is the status bar"
+    assert "closed" in app.statusbar["text"].lower()
+    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert focused == [True]
 
 
 def test_connection_lost_clears_every_tab_like_disconnect(root, patched_clients, monkeypatch):
@@ -745,6 +760,11 @@ def test_connection_lost_clears_every_tab_like_disconnect(root, patched_clients,
             "The connection to the domain controller was closed "
             "(it timed out or was dropped). Please reconnect.")
     app.ad_client.search_objects = dead_search
+    # Record the focus_set() call (focus_get() is None under xvfb).
+    focused = []
+    orig_focus_set = app.password_entry.focus_set
+    app.password_entry.focus_set = lambda: (
+        focused.append(True), orig_focus_set())
     app._ad_search_var.set("doe")
     app._ad_apply_filter()
     root.update_idletasks()
@@ -763,6 +783,12 @@ def test_connection_lost_clears_every_tab_like_disconnect(root, patched_clients,
     assert app.password_var.get() == ""
     assert str(app.connect_btn["state"]) == "normal"
     assert str(app.disconnect_btn["state"]) == "disabled"
+    # No modal popup; the notice is the highlighted status bar, and
+    # the focus is in the password field, ready to reconnect.
+    assert shown == [], "no popup expected — the notice is the status bar"
+    assert "closed" in app.statusbar["text"].lower()
+    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert focused == [True]
 
 
 def test_connection_lost_via_info_refresh_clears_every_tab(root, patched_clients, monkeypatch):
@@ -803,6 +829,11 @@ def test_connection_lost_via_info_refresh_clears_every_tab(root, patched_clients
     app.ad_client.list_sites = dead
     app.ad_client.list_subnets = dead
     app.ad_client.list_trusted_domains = dead
+    # Record the focus_set() call (focus_get() is None under xvfb).
+    focused = []
+    orig_focus_set = app.password_entry.focus_set
+    app.password_entry.focus_set = lambda: (
+        focused.append(True), orig_focus_set())
     app._info_refresh(quiet=False)
     root.update_idletasks()
 
@@ -812,11 +843,30 @@ def test_connection_lost_via_info_refresh_clears_every_tab(root, patched_clients
     assert len(app.dhcp_scopes.get_children()) == 0
     assert len(app.dns_zones.get_children()) == 0
     assert app.info_text.get("1.0", tk.END).strip() == ""
-    assert shown, "expected a connection-closed message"
-    text = " ".join(str(a) for a in shown[0])
-    assert "Broken pipe" not in text
-    assert "closed" in text.lower()
+    assert shown == [], "no popup expected — the notice is the status bar"
+    assert "closed" in app.statusbar["text"].lower()
+    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert focused == [True]
     assert str(app.connect_btn["state"]) == "normal"
+
+
+def test_status_bar_highlight_for_important_messages(root, patched_clients):
+    """set_status(important=True) highlights the status bar with a
+    subtle amber background (v1.8.11); a normal message reverts it
+    to the plain bar. The highlight is theme-aware (dark amber on a
+    dark bar, light amber on a light one)."""
+    import tkinter.ttk as ttk
+    app = MSATApp(root)
+    # Plain by default.
+    assert app.statusbar.cget("style") in ("", "TLabel")
+    app.set_status("Connection closed.", important=True)
+    assert app.statusbar.cget("style") == "Important.TLabel"
+    bg = ttk.Style().lookup("Important.TLabel", "background")
+    assert bg, "expected a highlight background color"
+    # A normal message reverts the highlight.
+    app.set_status("Ready.")
+    assert app.statusbar.cget("style") == "TLabel"
+    assert app.statusbar["text"] == "Ready."
 
 
 def test_ad_list_shows_locked_column(root, patched_clients):

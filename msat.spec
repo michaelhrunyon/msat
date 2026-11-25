@@ -62,7 +62,7 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'MSAT',
         'CFBundleDisplayName': 'MSAT — macOS Server Administration Tools',
-        'CFBundleShortVersionString': '1.8.10',
+        'CFBundleShortVersionString': '1.8.11',
         'NSHighResolutionCapable': 'True',
     },
 )
