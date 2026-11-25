@@ -676,7 +676,7 @@ def test_connection_lost_during_search_returns_to_login(root, patched_clients, m
     # and is highlighted so it draws the eye.
     assert "closed" in app.statusbar["text"].lower()
     assert "Broken pipe" not in app.statusbar["text"]
-    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert app.statusbar.cget("background") == app._status_highlight_bg
     assert str(app.connect_btn["state"]) == "normal"
     # Focus is requested in the password field, ready to reconnect.
     # (focus_get() is None under xvfb — the window has no window-
@@ -715,7 +715,7 @@ def test_connection_lost_during_list_load_returns_to_login(root, patched_clients
     assert app.ad_client is None
     assert shown == [], "no popup expected — the notice is the status bar"
     assert "closed" in app.statusbar["text"].lower()
-    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert app.statusbar.cget("background") == app._status_highlight_bg
     assert focused == [True]
 
 
@@ -787,7 +787,7 @@ def test_connection_lost_clears_every_tab_like_disconnect(root, patched_clients,
     # the focus is in the password field, ready to reconnect.
     assert shown == [], "no popup expected — the notice is the status bar"
     assert "closed" in app.statusbar["text"].lower()
-    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert app.statusbar.cget("background") == app._status_highlight_bg
     assert focused == [True]
 
 
@@ -845,28 +845,102 @@ def test_connection_lost_via_info_refresh_clears_every_tab(root, patched_clients
     assert app.info_text.get("1.0", tk.END).strip() == ""
     assert shown == [], "no popup expected — the notice is the status bar"
     assert "closed" in app.statusbar["text"].lower()
-    assert app.statusbar.cget("style") == "Important.TLabel"
+    assert app.statusbar.cget("background") == app._status_highlight_bg
     assert focused == [True]
     assert str(app.connect_btn["state"]) == "normal"
 
 
 def test_status_bar_highlight_for_important_messages(root, patched_clients):
     """set_status(important=True) highlights the status bar with a
-    subtle amber background (v1.8.11); a normal message reverts it
-    to the plain bar. The highlight is theme-aware (dark amber on a
-    dark bar, light amber on a light one)."""
-    import tkinter.ttk as ttk
+    subtle amber background (v1.8.11, fixed in v1.8.12); a normal
+    message reverts it to the plain bar. The bar is a plain tk.Label
+    with an explicit background — a ttk style background does not
+    render on macOS Aqua, so v1.8.11's highlight never showed. The
+    highlight is theme-aware (dark amber on a dark bar, light amber
+    on a light one)."""
     app = MSATApp(root)
     # Plain by default.
-    assert app.statusbar.cget("style") in ("", "TLabel")
+    assert app.statusbar.cget("background") == app._status_normal_bg
+    assert app._status_highlight_bg, "expected a highlight color"
+    assert app._status_highlight_bg != app._status_normal_bg
     app.set_status("Connection closed.", important=True)
-    assert app.statusbar.cget("style") == "Important.TLabel"
-    bg = ttk.Style().lookup("Important.TLabel", "background")
-    assert bg, "expected a highlight background color"
+    assert app.statusbar.cget("background") == app._status_highlight_bg
     # A normal message reverts the highlight.
     app.set_status("Ready.")
-    assert app.statusbar.cget("style") == "TLabel"
+    assert app.statusbar.cget("background") == app._status_normal_bg
     assert app.statusbar["text"] == "Ready."
+
+
+def test_idle_timeout_disconnects_and_clears(root, patched_clients, monkeypatch):
+    """No user activity for IDLE_DISCONNECT_MS (v1.8.12): the app
+    disconnects on its own and clears every tab, with the notice in
+    the highlighted status bar and the focus in the password field.
+    This is the proactive path — the DC also closes idle LDAP
+    connections, but the app only discovers that on the next
+    operation, so without its own timer it would leave directory
+    data visible on an unattended workstation until the user next
+    clicks something."""
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+    assert app._idle_after_id is not None, "idle timer should be armed"
+
+    # Simulate loaded data on the AD tab.
+    app.ad_tree.insert("DC=example,DC=local", "end",
+                       iid="OU=Users,DC=example,DC=local", text="Users")
+    app.ad_list.insert("", "end", values=("jdoe", "user", "", "Enabled", ""))
+    root.update_idletasks()
+
+    # Record the focus_set() call (focus_get() is None under xvfb).
+    focused = []
+    orig_focus_set = app.password_entry.focus_set
+    app.password_entry.focus_set = lambda: (
+        focused.append(True), orig_focus_set())
+    app._on_idle_timeout()
+    root.update_idletasks()
+
+    assert app.ad_client is None
+    assert shown == [], "no popup expected — the notice is the status bar"
+    assert len(app.ad_tree.get_children()) == 0
+    assert len(app.ad_list.get_children()) == 0
+    assert app.password_var.get() == ""
+    assert "minutes without activity" in app.statusbar["text"]
+    assert app.statusbar.cget("background") == app._status_highlight_bg
+    assert focused == [True]
+    assert str(app.connect_btn["state"]) == "normal"
+
+
+def test_idle_timer_armed_on_connect_cancelled_on_disconnect(root, patched_clients):
+    """The idle timer is armed when the app connects and cancelled
+    when it disconnects, so it never fires after a manual
+    disconnect."""
+    app = MSATApp(root)
+    assert app._idle_after_id is None
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app._idle_after_id is not None
+    app._global_disconnect()
+    root.update_idletasks()
+    assert app._idle_after_id is None
+
+
+def test_user_activity_resets_idle_timer(root, patched_clients):
+    """A key press or mouse click re-arms the idle timer (v1.8.12)."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    first_id = app._idle_after_id
+    assert first_id is not None
+    app._on_user_activity()
+    root.update_idletasks()
+    assert app._idle_after_id is not None
+    assert app._idle_after_id != first_id, "timer should be re-armed"
 
 
 def test_ad_list_shows_locked_column(root, patched_clients):

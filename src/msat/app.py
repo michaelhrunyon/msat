@@ -22,7 +22,7 @@ from tkinter import messagebox, ttk
 
 from . import dialogs, updater
 from .constants import (APP_TITLE, APP_VERSION, DEFAULT_LDAPS_PORT,
-                        DEFAULT_WINRM_PORT)
+                        DEFAULT_WINRM_PORT, IDLE_DISCONNECT_MS)
 from .credentials import CredentialStore
 from .dhcp import DHCPManager
 from .dns import DNSManager
@@ -128,9 +128,15 @@ class MSATApp:
         self._build_dns_tab()
         self._build_info_tab()
 
-        self.statusbar = ttk.Label(root, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
+        self.statusbar = tk.Label(root, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
         self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
         self._init_status_highlight()
+        # Idle disconnect: if the user walks away, the app disconnects
+        # on its own (v1.8.12) instead of leaving directory data
+        # visible until the next click discovers a dead connection.
+        self._idle_after_id = None
+        root.bind("<KeyPress>", self._on_user_activity, add="+")
+        root.bind("<ButtonPress>", self._on_user_activity, add="+")
         self._build_menu()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -552,6 +558,12 @@ class MSATApp:
         # The AD buttons that act on a selected row follow the
         # selection as well as the connection (below).
         self._ad_update_action_buttons()
+        # Idle disconnect: arm the timer on connect, cancel it on
+        # disconnect (a disconnected app has nothing to time out).
+        if connected:
+            self._reset_idle_timer()
+        else:
+            self._cancel_idle_timer()
 
     # -- role detection and tab gating ------------------------------------
 
@@ -751,23 +763,29 @@ class MSATApp:
     # -- shared helpers ------------------------------------------------------
 
     def _init_status_highlight(self):
-        """Define the "Important.TLabel" style for the status bar.
+        """Work out the status bar's normal and highlighted backgrounds.
 
-        An important notification (e.g. a dropped connection) gets a
-        subtle amber background so it draws the eye, without being
-        glaring. Theme-aware: a dark warm amber on a dark bar, a
-        light warm amber on a light bar, so the text stays readable
-        either way. Falls back to the dark amber.
+        The bar is a plain tk.Label (not ttk.Label): a ttk style
+        background does not render on macOS Aqua, so v1.8.11's
+        highlight never showed. A tk.Label background is a core Tk
+        feature and does render. Theme-aware: the normal background
+        is the theme's label background; the highlight is a subtle
+        warm amber (dark amber on a dark bar, light amber on a light
+        bar) so the text stays readable either way.
         """
         try:
-            bg = ttk.Style().lookup("TLabel", "background") or ""
-            r, g, b = self.root.winfo_rgb(bg)
+            normal = ttk.Style().lookup("TLabel", "background") or ""
+            r, g, b = self.root.winfo_rgb(normal)
             # winfo_rgb returns 16-bit values.
             luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 65535.0
         except Exception:  # noqa: BLE001 - fall back to dark amber
+            normal = ""
             luminance = 0.0
-        highlight = "#5C4A1A" if luminance < 0.5 else "#FFF3CD"
-        ttk.Style().configure("Important.TLabel", background=highlight)
+        self._status_normal_bg = normal
+        self._status_highlight_bg = (
+            "#5C4A1A" if luminance < 0.5 else "#FFF3CD")
+        if normal:
+            self.statusbar.config(background=normal)
 
     def set_status(self, message, important=False):
         """Set the status bar text.
@@ -776,9 +794,49 @@ class MSATApp:
         background so an important notification draws the eye; a
         normal message reverts to the plain bar.
         """
-        self.statusbar.config(text=message)
         self.statusbar.config(
-            style="Important.TLabel" if important else "TLabel")
+            text=message,
+            background=(self._status_highlight_bg if important
+                        else self._status_normal_bg))
+
+    # -- idle disconnect ----------------------------------------------------
+
+    def _on_user_activity(self, event=None):
+        """Any key press or mouse click resets the idle timer."""
+        self._reset_idle_timer()
+
+    def _reset_idle_timer(self):
+        """(Re)arm the idle-disconnect timer. Only while connected;
+        a disconnected app has nothing to time out."""
+        self._cancel_idle_timer()
+        if self.ad_client is not None:
+            self._idle_after_id = self.root.after(
+                IDLE_DISCONNECT_MS, self._on_idle_timeout)
+
+    def _cancel_idle_timer(self):
+        after_id = getattr(self, "_idle_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            self._idle_after_id = None
+
+    def _on_idle_timeout(self):
+        """No user activity for IDLE_DISCONNECT_MS: disconnect and
+        clear every tab, exactly like clicking Disconnect, so no
+        directory data is left visible on an unattended workstation.
+        The notice is the highlighted status bar, and the focus
+        lands in the password field for a quick reconnect."""
+        self._idle_after_id = None
+        if self.ad_client is None:
+            return
+        self._global_disconnect()
+        self.root.update_idletasks()
+        self.set_status("Disconnected after {} minutes without activity. "
+                        "Please reconnect.".format(IDLE_DISCONNECT_MS // 60000),
+                        important=True)
+        self.password_entry.focus_set()
 
     def _error(self, exc):
         # A dead LDAP connection is not just an error to report: the
@@ -840,6 +898,7 @@ class MSATApp:
 
     def _on_close(self):
         self._cancel_startup_check()
+        self._cancel_idle_timer()
         if self.ad_client is not None:
             self.ad_client.disconnect()
         self.creds.clear()

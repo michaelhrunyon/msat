@@ -300,9 +300,10 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.11** — tested against a live Active Directory environment (3 DCs). 250 tests passing.
+**v1.8.12** — tested against a live Active Directory environment (3 DCs). 253 tests passing.
 
-- **Timeout disconnect, no popup:** when the DC closes the connection, the app now clears all shown data and returns to the login screen at once — no modal popup. The notice is the status bar, highlighted with a subtle amber background so it draws the eye, and the cursor lands in the password field so you can just type the password and reconnect.
+- **Status bar highlight now actually shows:** the bar is a plain tk.Label with an explicit background — the ttk style background in v1.8.11 never rendered on macOS Aqua, so the highlight was invisible.
+- **Idle disconnect:** if there is no key press or mouse click for 15 minutes, the app disconnects on its own and clears every tab, with the notice in the highlighted status bar and the cursor in the password field. The DC also closes idle LDAP connections, but the app only discovers that on the next operation, so without its own timer it would leave directory data visible on an unattended workstation until the user next clicks something.
 
 ## Known limitations
 

@@ -40,10 +40,17 @@ shown data — AD, DHCP, DNS and Directory Info — and wipes the
 password, exactly like clicking **Disconnect** (v1.8.10), so no
 directory data is left visible on an unattended workstation.
 There is no popup (v1.8.11): the notice is the status bar, which
-is highlighted with a subtle amber background so it draws the eye,
-and the cursor lands in the password field so you can just type
-the password and reconnect. The app no longer shows the raw
-"Broken pipe" error.
+is highlighted with a subtle amber background so it draws the eye
+(the highlight is a real background colour since v1.8.12 — the
+ttk style background in v1.8.11 never rendered on macOS), and the
+cursor lands in the password field so you can just type the
+password and reconnect. The app no longer shows the raw
+"Broken pipe" error. **Idle disconnect (v1.8.12):** if there is no
+key press or mouse click for 15 minutes, the app disconnects on
+its own and clears every tab — the DC also closes idle
+connections, but the app only discovers that on the next
+operation, so its own timer is what clears the data while you
+are away.
 
 **Role detection.** Once the credentials check out, the app
 examines the installed roles on the connected server (over WinRM)
