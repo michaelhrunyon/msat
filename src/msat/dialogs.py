@@ -1230,7 +1230,13 @@ class AddRecordDialog(DialogBase):
         ttk.Label(self.body, text="Zone: {}".format(zone_name)).pack(anchor=tk.W, pady=2)
         self.rtype = self._combo_row("Record type", ["A", "CNAME", "PTR", "MX"], "A")
         self.rtype.bind("<<ComboboxSelected>>", lambda _e: self._update_labels())
-        self.name = self._row("Record name (use @ for the zone apex)")
+        # The name field starts with "@" (the zone apex): the old
+        # label "Record name (use @ for the zone apex)" was wider
+        # than the dialog and got cut off. "@" is a real, valid
+        # value — leaving it creates an apex record — and focusing
+        # the field selects it, so typing a name replaces it.
+        self.name = self._row("Record name", "@")
+        self.name.bind("<FocusIn>", self._select_name_hint)
         self.data_label = ttk.Label(self.body, text="IPv4 address")
         self.data_label.pack(anchor=tk.W)
         self.data = ttk.Entry(self.body, width=40)
@@ -1240,6 +1246,16 @@ class AddRecordDialog(DialogBase):
         self.ttl = self._row("TTL in seconds (optional)")
         self._update_labels()
         self._finish_buttons()
+
+    def _select_name_hint(self, _event):
+        """Select the pre-filled "@" when the name field gains focus.
+
+        FocusIn is delivered after the click that focuses the field
+        has positioned the insertion cursor, so a selection made
+        here sticks and the next keystroke replaces the hint instead
+        of being inserted beside it.
+        """
+        self.name.select_range(0, tk.END)
 
     def _update_labels(self):
         rtype = self.rtype.get()

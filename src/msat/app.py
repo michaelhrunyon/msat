@@ -26,7 +26,7 @@ from .constants import (APP_TITLE, APP_VERSION, DEFAULT_LDAPS_PORT,
 from .credentials import CredentialStore
 from .dhcp import DHCPManager
 from .dns import DNSManager
-from .ldap_client import ADClient, ADInvalidCredentialsError, parent_dn
+from .ldap_client import ADClient, ADConnectionLostError, ADInvalidCredentialsError, parent_dn
 from .settings import load_settings, save_settings
 from .winrm_client import WinRMClient, detect_server_roles
 
@@ -34,6 +34,10 @@ from .winrm_client import WinRMClient, detect_server_roles
 # ASCII on purpose: a null byte ("\x00") in a Treeview iid is silently
 # truncated by Tcl, so "DN\x00loading" collides with the DN itself.
 _LOADING_SUFFIX = "__loading__"
+
+# Debounce delay (ms) for the search boxes: typing filters the list
+# this long after the last keystroke.
+SEARCH_DEBOUNCE_MS = 150
 
 
 def _dn_label(dn):
@@ -93,6 +97,17 @@ class MSATApp:
         # dict. _global_disconnect cancels them so a filter cannot
         # fire after the trees have been cleared.
         self._search_debounce_pending = []
+        # AD search state. _ad_search_results is None in browse mode
+        # (the list shows the current container's children) and the
+        # list of recursive-search result dicts in search mode — the
+        # list-select handler navigates on click only in search mode.
+        # _ad_suppress_tree_select is set while navigation selects a
+        # tree node programmatically; _ad_on_tree_select consumes it
+        # (clears it and returns) so it does not reload a list that
+        # was just loaded, which would wipe the row selected during
+        # navigation.
+        self._ad_search_results = None
+        self._ad_suppress_tree_select = False
 
         self._build_global_bar()
 
@@ -462,6 +477,7 @@ class MSATApp:
         self._clear_tree(self.ad_list)
         self._ad_current_dn = None
         self._ad_rows = []
+        self._ad_search_results = None
         # Cancel any pending search-debounce timers before clearing
         # the search text: a keystroke made just before Disconnect
         # schedules a filter 150 ms out, and without cancelling it
@@ -737,8 +753,36 @@ class MSATApp:
         self.statusbar.config(text=message)
 
     def _error(self, exc):
+        # A dead LDAP connection is not just an error to report: the
+        # session is over, so return to the login-ready state and say
+        # so plainly, instead of leaving the app looking connected
+        # with a cryptic "Broken pipe" dialog.
+        if isinstance(exc, ADConnectionLostError) and self.ad_client is not None:
+            self._ad_connection_lost(exc)
+            return
         messagebox.showerror("Error", str(exc), parent=self.root)
         self.set_status("Error: {}".format(exc))
+
+    def _ad_connection_lost(self, exc):
+        """The DC closed the LDAP connection (idle timeout / dropped).
+
+        The old behaviour showed the raw socket error ("LDAP search
+        failed: socket sending error[Errno 32] Broken pipe") and left
+        the app looking connected, so the next operation failed the
+        same way. Instead, say plainly that the connection was
+        closed and return to the login-ready state — the user just
+        hits Connect again.
+        """
+        self._global_disconnect()
+        messagebox.showwarning(
+            "Connection closed",
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped).\n\n"
+            "You have been returned to the login screen — "
+            "click Connect to sign in again.",
+            parent=self.root)
+        self.set_status("Connection to the domain controller was closed. "
+                        "Please reconnect.")
 
     def _fail_connect(self, title, message, status_message):
         """Leave the app cleanly disconnected and say why.
@@ -829,7 +873,8 @@ class MSATApp:
             if _pending["after_id"] is not None:
                 entry.after_cancel(_pending["after_id"])
                 _pending["after_id"] = None
-            _pending["after_id"] = entry.after(150, _on_debounced)
+            _pending["after_id"] = entry.after(SEARCH_DEBOUNCE_MS,
+                                               _on_debounced)
 
         entry.bind("<KeyRelease>", _on_key_release)
         # A small clear (×) button beside the entry: empties the
@@ -942,9 +987,9 @@ class MSATApp:
         self.ad_list.column("Locked", width=60)
         self.ad_list.pack(fill=tk.BOTH, expand=True)
         self.ad_list.bind("<Double-Button-1>", self._ad_on_list_double_click)
-        # Selection changes gate the buttons that act on a row (below).
-        self.ad_list.bind("<<TreeviewSelect>>",
-                          lambda _e: self._ad_update_action_buttons())
+        # Selection changes gate the buttons that act on a row (below);
+        # in search mode a click also navigates to the result's OU.
+        self.ad_list.bind("<<TreeviewSelect>>", self._ad_on_list_select)
         # Right-click (Button-3) or Control-click (the macOS
         # right-click) opens the context menu.
         self.ad_list.bind("<Button-3>", self._ad_on_list_right_click)
@@ -1075,6 +1120,13 @@ class MSATApp:
                                     text="Loading…")
 
     def _ad_on_tree_select(self, _event):
+        # Consumed when set: this event is the programmatic
+        # selection made during search-result navigation, and the
+        # list for this node was just loaded — reloading it here
+        # would wipe the row selected during navigation.
+        if self._ad_suppress_tree_select:
+            self._ad_suppress_tree_select = False
+            return
         sel = self.ad_tree.selection()
         if not sel:
             return
@@ -1109,19 +1161,62 @@ class MSATApp:
         self._ad_apply_filter()
         return children
 
+    @staticmethod
+    def _ad_row_values(child):
+        """(Name, Type, Description, Status, Locked) for one list row.
+
+        "Locked" is its own column so a locked-out account is
+        identifiable at a glance ("Yes"); blank otherwise. Use
+        .get() — rows built by hand (e.g. in tests) may not carry
+        the key.
+        """
+        locked = "Yes" if child.get("locked") else ""
+        return (child["name"], child["type"].capitalize(),
+                child["description"], child["status"], locked)
+
     def _ad_apply_filter(self):
-        """Repopulate the object list from the loaded rows, applying the search text."""
-        rows = []
-        for child in self._ad_rows:
-            # "Locked" is its own column so a locked-out account is
-            # identifiable at a glance ("Yes"); blank otherwise. Use
-            # .get() — rows built by hand (e.g. in tests) may not
-            # carry the key.
-            locked = "Yes" if child.get("locked") else ""
-            rows.append((child["dn"], (child["name"], child["type"].capitalize(),
-                                        child["description"], child["status"],
-                                        locked)))
-        self._refill_filtered(self.ad_list, rows, self._ad_search_var.get())
+        """Repopulate the object list.
+
+        Empty search: the current container's children
+        (``self._ad_rows``), as before. Non-empty search: a recursive
+        (subtree) LDAP search from the selected node, so objects in
+        any OU below it are found. The old client-side filter only
+        saw the current container's direct children, so searching
+        from the domain root found nothing — the users live in OUs,
+        not at the root. The LDAP search already matched the query,
+        so the results are shown as-is: re-filtering them
+        client-side would drop rows whose sAMAccountName matched
+        but whose displayed name/description does not contain it.
+        """
+        search_text = (self._ad_search_var.get() or "").strip()
+        if search_text and self.ad_client is not None:
+            base_dn = (self._ad_current_dn
+                       or self.ad_client.get_default_naming_context())
+            try:
+                results = self.ad_client.search_objects(base_dn, search_text)
+            except Exception as exc:  # noqa: BLE001 - status bar, not modal
+                # A search is a background filter, not an explicit
+                # action: report the failure in the status bar, not a
+                # modal dialog (a modal on every keystroke while
+                # typing would be unusable). Except a dead connection:
+                # that ends the session, so it goes through _error,
+                # which returns the app to the login-ready state —
+                # and there is nothing left to display, so stop here
+                # instead of refilling the (now cleared) list.
+                if isinstance(exc, ADConnectionLostError):
+                    self._error(exc)
+                    return
+                self.set_status("Search failed: {}".format(exc))
+                results = []
+            self._ad_search_results = results
+            rows = [(child["dn"], self._ad_row_values(child))
+                    for child in results]
+            self._refill_filtered(self.ad_list, rows, "")
+        else:
+            self._ad_search_results = None
+            rows = [(child["dn"], self._ad_row_values(child))
+                    for child in self._ad_rows]
+            self._refill_filtered(self.ad_list, rows, "")
         # Refilling drops the selection, so the row-dependent buttons
         # must follow (below).
         self._ad_update_action_buttons()
@@ -1194,6 +1289,100 @@ class MSATApp:
         if self.ad_tree.exists(dn):
             self.ad_tree.selection_set(dn)
             self.ad_tree.see(dn)
+
+    def _ad_on_list_select(self, _event):
+        """List selection changed: gate the row buttons, and in
+        search mode navigate to the clicked result's OU.
+
+        A click on a search result moves the view to where that
+        object lives, so the user can act on it in context instead
+        of staring at a detached search hit. Browse mode is
+        untouched — a click there only selects the row.
+        """
+        self._ad_update_action_buttons()
+        if self._ad_search_results is None:
+            return
+        sel = self.ad_list.selection()
+        if not sel:
+            return
+        self._ad_navigate_to_result(sel[0])
+
+    def _ad_navigate_to_result(self, dn):
+        """Move the list (and tree) to the OU holding ``dn``.
+
+        A leaf object (user / computer / group) moves to its parent
+        OU, which is then shown with the object selected. A
+        container result moves into itself. The search box is
+        cleared first, so the list shows the container's children
+        rather than the search hits.
+        """
+        if self.ad_client is None:
+            return
+        values = self.ad_list.item(dn, "values")
+        obj_type = values[1].lower() if len(values) > 1 else ""
+        if obj_type in ("ou", "container", "domain"):
+            target_dn = dn
+        else:
+            target_dn = parent_dn(dn)
+        if not target_dn:
+            return
+        # Clear the search before refreshing: _ad_apply_filter
+        # switches back to browse mode on an empty search, so the
+        # list shows the target's children.
+        self._ad_search_var.set("")
+        self._ad_current_dn = target_dn
+        self._ad_refresh_list(target_dn)
+        self._ad_reveal_in_tree(target_dn)
+        # Select the object itself in the list (it is a child of the
+        # target, unless the target IS the object — a container
+        # result — in which case there is nothing to select here).
+        if dn != target_dn and self.ad_list.exists(dn):
+            self.ad_list.selection_set(dn)
+            self.ad_list.focus(dn)
+            self.ad_list.see(dn)
+        self._ad_update_action_buttons()
+
+    def _ad_reveal_in_tree(self, dn):
+        """Ensure the tree contains and selects ``dn``.
+
+        Walks from the domain root down to ``dn``, expanding each
+        ancestor (loading its children from LDAP as needed) so the
+        node exists in the tree, then selects it and scrolls it into
+        view. The programmatic selection is made with
+        _ad_suppress_tree_select set, so _ad_on_tree_select does not
+        reload a list that was just loaded. Returns True when the
+        node is selected.
+        """
+        if self.ad_client is None or not dn:
+            return False
+        root_dn = self.ad_client.get_default_naming_context()
+        # Ancestor chain from the root down to dn.
+        chain = []
+        cur = dn
+        while cur:
+            chain.append(cur)
+            if cur.lower() == root_dn.lower():
+                break
+            cur = parent_dn(cur)
+        else:
+            return False  # dn is not under the domain root
+        chain.reverse()
+        for ancestor in chain:
+            if not self.ad_tree.exists(ancestor):
+                return False
+            self._ad_ensure_tree_children(ancestor)
+            self.ad_tree.item(ancestor, open=True)
+        if not self.ad_tree.exists(dn):
+            return False
+        # Only set the suppression flag when the selection actually
+        # changes: selection_set on an already-selected node fires
+        # no event, so a flag set for it would linger and swallow
+        # the next real selection.
+        if self.ad_tree.selection() != (dn,):
+            self._ad_suppress_tree_select = True
+            self.ad_tree.selection_set(dn)
+        self.ad_tree.see(dn)
+        return True
 
     def _ad_selected(self):
         """(dn, name, type) of the selected list row, or None."""

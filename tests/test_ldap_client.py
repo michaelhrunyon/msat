@@ -36,9 +36,11 @@ def _build_mock_conn():
         {"objectClass": ["person", "user"], "userPassword": "Secret123"})
     add(DOMAIN_DN, {"objectClass": ["domain", "top"], "dc": "example"})
     add("OU=IT," + DOMAIN_DN,
-        {"objectClass": ["organizationalUnit", "top"], "ou": "IT"})
+        {"objectClass": ["organizationalUnit", "top"], "ou": "IT",
+         "name": "IT"})
     add("OU=Users," + DOMAIN_DN,
-        {"objectClass": ["organizationalUnit", "top"], "ou": "Users"})
+        {"objectClass": ["organizationalUnit", "top"], "ou": "Users",
+         "name": "Users"})
     add("CN=System," + DOMAIN_DN,
         {"objectClass": ["container", "top"], "cn": "System"})
     add("CN=jdoe,OU=Users," + DOMAIN_DN,
@@ -255,6 +257,64 @@ def test_search_users_excludes_computers(client):
 def test_search_groups(client):
     results = client.search_groups(DOMAIN_DN, "Adm")
     assert [r["sam"] for r in results] == ["Admins"]
+
+
+def test_search_objects_is_recursive_from_the_root(client):
+    """search_objects (v1.8.9): a subtree search from the domain
+    root finds objects living in OUs — the old AD-tab filter only
+    saw the root's direct children, so it found nothing there."""
+    results = client.search_objects(DOMAIN_DN, "doe")
+    assert [r["sam"] for r in results] == ["jdoe"]
+    # Computer and group, both in OU=IT, are found from the root too.
+    results = client.search_objects(DOMAIN_DN, "WS01")
+    assert [r["name"] for r in results] == ["WS01"]
+    assert results[0]["type"] == "computer"
+    results = client.search_objects(DOMAIN_DN, "Adm")
+    assert [r["sam"] for r in results] == ["Admins"]
+    # An OU itself matches by name.
+    results = client.search_objects(DOMAIN_DN, "Users")
+    assert [r["name"] for r in results] == ["Users"]
+    assert results[0]["type"] == "ou"
+
+
+def test_search_objects_is_scoped_to_the_selected_node(client):
+    """The same search from OU=IT does not find the user in
+    OU=Users; from OU=Users it does."""
+    assert client.search_objects("OU=IT," + DOMAIN_DN, "doe") == []
+    results = client.search_objects("OU=Users," + DOMAIN_DN, "doe")
+    assert [r["sam"] for r in results] == ["jdoe"]
+
+
+def test_broken_pipe_becomes_connection_lost(client, monkeypatch):
+    """A dead DC connection (v1.8.9): a socket send/receive error or
+    a server-terminated session becomes ADConnectionLostError with a
+    plain message, instead of the raw "LDAP search failed: socket
+    sending error[Errno 32] Broken pipe". Other LDAP failures stay
+    plain ADError."""
+    from ldap3.core.exceptions import (
+        LDAPException, LDAPSessionTerminatedByServerError,
+        LDAPSocketReceiveError, LDAPSocketSendError)
+    from msat.ldap_client import ADConnectionLostError, ADError
+
+    for err in (LDAPSocketSendError("socket sending error[Errno 32] Broken pipe"),
+                LDAPSocketReceiveError("socket receiving error[Errno 104] Connection reset by peer"),
+                LDAPSessionTerminatedByServerError("session terminated")):
+        def failing_search(*a, **k):
+            raise err
+        monkeypatch.setattr(client.conn, "search", failing_search)
+        with pytest.raises(ADConnectionLostError) as excinfo:
+            client.search_users(DOMAIN_DN, "doe")
+        assert "timed out or was dropped" in str(excinfo.value)
+        assert "Broken pipe" not in str(excinfo.value)
+
+    # A non-socket LDAP failure is not a lost connection.
+    def failing_search_plain(*a, **k):
+        raise LDAPException("operations error")
+    monkeypatch.setattr(client.conn, "search", failing_search_plain)
+    with pytest.raises(ADError) as excinfo:
+        client.search_users(DOMAIN_DN, "doe")
+    assert not isinstance(excinfo.value, ADConnectionLostError)
+    assert "operations error" in str(excinfo.value)
 
 
 def test_search_users_escapes_filter_chars_rfc4515(client, monkeypatch):

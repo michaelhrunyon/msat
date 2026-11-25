@@ -34,6 +34,12 @@ while a connection is underway, and once connected it returns to
 gray and **Disconnect** is blue instead. If the connection fails,
 both return to gray.
 
+**If the connection drops** (the DC closes it after a period of
+inactivity, v1.8.9): the next operation says plainly that the
+connection was closed and returns the app to the login screen —
+just click **Connect** again. The app no longer shows the raw
+"Broken pipe" error and leaves itself looking connected.
+
 **Role detection.** Once the credentials check out, the app
 examines the installed roles on the connected server (over WinRM)
 and enables each tab only where its role is present: AD and
@@ -144,14 +150,17 @@ folder and outside the app bundle.
   lockout expires) and is blank otherwise, so locked accounts are
   identifiable at a glance. The Status column also reads
   "Enabled, Locked" / "Disabled, Locked" for those accounts.
-- **Search:** the Search box above the right-hand list filters the
-  rows already loaded for the current container as you type
-  (case-insensitive, matches Name, Type, Description, Status or
-  Locked). Clearing it shows everything again. It does not run a
-  new search against the server. The small **×** button beside the
-  box clears the search text and restores the full list. The
-  filter waits a short moment after you stop typing before
-  rebuilding the list, so typing stays smooth in large containers.
+- **Search:** the Search box above the right-hand list searches the
+  whole subtree below the selected node (users, computers, groups
+  and OUs — v1.8.9; it used to filter only the current container's
+  direct children, so searching from the domain root found nothing).
+  It matches Name, sAMAccountName or display name, case-insensitive.
+  Clearing it shows the current container's children again. The
+  small **×** button beside the box clears the search text and
+  restores the full list. The filter waits a short moment after you
+  stop typing before searching, so typing stays smooth. Clicking a
+  search result moves the view to the OU holding that object (a
+  container result moves into itself), with the object selected.
 - **Properties:** double-click a user or a group (or select one and
   click **Properties**) to open its properties. For a user, the
   **General** tab edits the common attributes (display name,
@@ -261,11 +270,13 @@ folder and outside the app bundle.
   even while a search filter is active.
 - **Select a zone** to see its records (hostname, type, data, TTL).
 - **Add Record:** choose the type — A (IPv4), CNAME (alias), PTR
-  (reverse), MX (mail). For the zone apex use `@` as the record name.
-  For PTR records, select the reverse zone (e.g.
-  `1.168.192.in-addr.arpa`) and enter the last octet as the name.
-  TTL is optional (leave blank for the zone default). A negative
-  TTL is rejected.
+  (reverse), MX (mail). For the zone apex use `@` as the record name:
+  the name field starts with `@` already filled in (v1.8.9) — leave
+  it for an apex record, or click into the field (the `@` is selected)
+  and type a name to replace it. For PTR records, select the reverse
+  zone (e.g. `1.168.192.in-addr.arpa`) and enter the last octet as
+  the name. TTL is optional (leave blank for the zone default). A
+  negative TTL is rejected.
 - **Edit Record:** select a record and click **Edit Record** (or
   double-click it) to change its data and TTL in place — A, AAAA,
   CNAME, PTR, MX and TXT. The record name and type are the identity

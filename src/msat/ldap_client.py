@@ -19,7 +19,9 @@ AD-specific details handled here:
 
 from ldap3 import ALL, BASE, LEVEL, SUBTREE, Connection, Server
 from ldap3 import MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
-from ldap3.core.exceptions import LDAPException
+from ldap3.core.exceptions import (
+    LDAPException, LDAPSessionTerminatedByServerError,
+    LDAPSocketReceiveError, LDAPSocketSendError)
 from ldap3.strategy.mockSync import MockSyncStrategy
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import escape_rdn
@@ -51,8 +53,38 @@ class ADConnectionError(ADError):
     """Raised when the LDAP connection / bind fails."""
 
 
+class ADConnectionLostError(ADError):
+    """The DC closed an established LDAP connection mid-session
+    (idle timeout, dropped socket). The app treats this as "signed
+    out — please reconnect" instead of showing the raw socket error."""
+
+
 class ADInvalidCredentialsError(ADConnectionError):
     """The username or password was rejected by the DC (result 49)."""
+
+
+# ldap3 errors that mean the DC closed the connection mid-session,
+# as opposed to a failed bind or a bad filter: a send failure
+# (Broken pipe), a receive failure (connection reset), or the server
+# terminating the session.
+_CONNECTION_LOST_ERRORS = (LDAPSocketSendError, LDAPSocketReceiveError,
+                           LDAPSessionTerminatedByServerError)
+
+
+def _raise_ldap_error(exc, what):
+    """Raise the right ADError for an LDAP operation failure.
+
+    A dead connection becomes ADConnectionLostError, so the app can
+    return to the login screen with a plain message instead of
+    showing the raw socket error ("LDAP search failed: socket
+    sending error[Errno 32] Broken pipe"). Everything else keeps
+    the existing "<what> failed: <detail>" message.
+    """
+    if isinstance(exc, _CONNECTION_LOST_ERRORS):
+        raise ADConnectionLostError(
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped). Please reconnect.") from exc
+    raise ADError("{} failed: {}".format(what, exc)) from exc
 
 
 def domain_to_dn(domain):
@@ -401,7 +433,7 @@ class ADClient:
                 base_dn, search_filter, search_scope=scope,
                 attributes=attributes, paged_size=500, generator=False)
         except LDAPException as exc:
-            raise ADError("LDAP search failed: {}".format(exc)) from exc
+            _raise_ldap_error(exc, "LDAP search")
         code = self.conn.result.get("result")
         if code is not None and code != 0:
             raise ADError("LDAP search failed: {}".format(
@@ -424,7 +456,7 @@ class ADClient:
             ok = self.conn.search(base_dn, search_filter,
                                   search_scope=scope, attributes=attributes)
         except LDAPException as exc:
-            raise ADError("LDAP search failed: {}".format(exc)) from exc
+            _raise_ldap_error(exc, "LDAP search")
         code = self.conn.result.get("result")
         if code is None:
             if not ok:
@@ -441,7 +473,7 @@ class ADClient:
         try:
             ok = self.conn.modify(dn, changes)
         except LDAPException as exc:
-            raise ADError("{} failed: {}".format(what, exc)) from exc
+            _raise_ldap_error(exc, what)
         if not ok:
             raise ADError("{} failed: {}".format(
                 what, self.conn.result.get("description", "unknown error")))
@@ -451,7 +483,7 @@ class ADClient:
         try:
             ok = self.conn.add(dn, object_classes, attributes)
         except LDAPException as exc:
-            raise ADError("{} failed: {}".format(what, exc)) from exc
+            _raise_ldap_error(exc, what)
         if not ok:
             raise ADError("{} failed: {}".format(
                 what, self.conn.result.get("description", "unknown error")))
@@ -665,6 +697,27 @@ class ADClient:
         entries = self._search(base_dn, search_filter, self.LIST_ATTRS)
         return [self.entry_to_dict(e) for e in entries]
 
+    def search_objects(self, base_dn, query):
+        """Users, computers, groups, OUs and containers under
+        ``base_dn`` (whole subtree) whose name / sAMAccountName /
+        displayName matches ``query``.
+
+        Used by the AD tab search: typing in the search box searches
+        every OU below the selected node, not just the direct children
+        shown in the list. Computer objects also carry
+        objectClass=user in AD; they are classified by
+        entry_to_dict (computer wins), so no exclusion is needed here.
+        """
+        q = escape_filter_chars(query)
+        search_filter = (
+            "(&(|(objectClass=organizationalUnit)(objectClass=container)"
+            "(objectClass=builtinDomain)(objectClass=user)"
+            "(objectClass=computer)(objectClass=group))"
+            "(|(name=*{0}*)(sAMAccountName=*{0}*)(displayName=*{0}*)))"
+            .format(q))
+        entries = self._search(base_dn, search_filter, self.LIST_ATTRS)
+        return [self.entry_to_dict(e) for e in entries]
+
     def resolve_members(self, member_dns):
         """Resolve member DNs to display info with a single search.
 
@@ -844,7 +897,7 @@ class ADClient:
         try:
             ok = self.conn.delete(dn)
         except LDAPException as exc:
-            raise ADError("Delete {} failed: {}".format(dn, exc)) from exc
+            _raise_ldap_error(exc, "Delete {}".format(dn))
         if not ok:
             raise ADError("Delete {} failed: {}".format(
                 dn, self.conn.result.get("description", "unknown error")))
@@ -867,7 +920,7 @@ class ADClient:
         try:
             ok = self.conn.modify_dn(dn, rdn, new_superior=new_parent_dn)
         except LDAPException as exc:
-            raise ADError("Move {} failed: {}".format(dn, exc)) from exc
+            _raise_ldap_error(exc, "Move {}".format(dn))
         if not ok:
             raise ADError("Move {} failed: {}".format(
                 dn, self.conn.result.get("description", "unknown error")))

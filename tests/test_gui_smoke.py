@@ -52,6 +52,9 @@ class FakeADClient:
     def list_children(self, dn):
         return []
 
+    def search_objects(self, base_dn, query):
+        return []
+
 
 class FakeWinRM(FakeWinRMClient):
     """FakeWinRMClient that accepts WinRMClient's constructor arguments."""
@@ -491,21 +494,43 @@ def test_search_entries_enable_with_connection(root, patched_clients):
         assert str(entry["state"]) == "disabled"
 
 
-def test_ad_search_filters_rows(root, patched_clients):
+def test_ad_search_is_recursive_server_search(root, patched_clients):
+    """Typing in the AD search box runs a recursive (subtree) LDAP
+    search from the selected node (v1.8.9) and shows those results;
+    clearing it restores the current container's children. The old
+    client-side filter only saw the current container's direct
+    children, so searching from the domain root found nothing."""
     app = MSATApp(root)
     _connect_app(app, "dc1")
     root.update_idletasks()
-    app._ad_rows = [
-        {"dn": "CN=jdoe,DC=example,DC=local", "name": "John Doe",
+    all_rows = [
+        {"dn": "CN=jdoe,OU=Users,DC=example,DC=local", "name": "John Doe",
          "type": "user", "description": "Analyst", "status": "Enabled"},
-        {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
+        {"dn": "CN=asmith,OU=Users,DC=example,DC=local", "name": "Alice Smith",
          "type": "user", "description": "Manager", "status": "Enabled"},
     ]
+    # The fake server search: substring match on name/description,
+    # as the real search_objects does on name/sAMAccountName/
+    # displayName across the whole subtree.
+    searched = []
+
+    def fake_search(base_dn, query):
+        searched.append((base_dn, query))
+        needle = query.lower()
+        return [r for r in all_rows
+                if needle in r["name"].lower()
+                or needle in r["description"].lower()]
+
+    app.ad_client.search_objects = fake_search
+    app._ad_rows = list(all_rows)
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 2
+    assert app._ad_search_results is None  # browse mode
     app._ad_search_var.set("john")
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 1
+    assert app._ad_search_results is not None  # search mode
+    assert searched[-1][1] == "john"
     app._ad_search_var.set("MANAGER")
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 1  # case-insensitive
@@ -515,6 +540,168 @@ def test_ad_search_filters_rows(root, patched_clients):
     app._ad_search_var.set("")
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 2  # clearing restores all
+    assert app._ad_search_results is None
+
+
+def test_ad_search_result_click_navigates_to_parent_ou(root, patched_clients):
+    """Clicking a search result moves the view to the OU holding it
+    (v1.8.9): the search clears, the list shows the parent OU's
+    children with the object selected, and the tree selects the
+    parent OU. Clicking a result that IS a container moves into it."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    root_dn = "DC=example,DC=local"
+    users_ou = "OU=Users," + root_dn
+    jdoe = {"dn": "CN=jdoe," + users_ou, "name": "John Doe", "type": "user",
+            "description": "Analyst", "status": "Enabled", "locked": False}
+    users_row = {"dn": users_ou, "name": "Users", "type": "ou",
+                 "description": "", "status": "", "locked": False}
+
+    def list_children(dn):
+        if dn == root_dn:
+            return [users_row]
+        if dn == users_ou:
+            return [jdoe]
+        return []
+
+    def search_objects(base_dn, query):
+        return [jdoe] if "doe" in query.lower() else []
+
+    app.ad_client.list_children = list_children
+    app.ad_client.search_objects = search_objects
+    # Select the root: the list shows the Users OU, the tree holds it.
+    app.ad_tree.selection_set(root_dn)
+    app._ad_on_tree_select(None)
+    root.update_idletasks()
+    assert app._ad_current_dn == root_dn
+    assert app.ad_tree.exists(users_ou)
+    # Search from the root for the user (who lives in OU=Users).
+    app._ad_search_var.set("doe")
+    app._ad_apply_filter()
+    root.update_idletasks()
+    assert [i for i in app.ad_list.get_children()] == [jdoe["dn"]]
+    assert app._ad_search_results is not None
+    # Click the result: navigate to the parent OU.
+    app.ad_list.selection_set(jdoe["dn"])
+    app._ad_on_list_select(None)
+    root.update_idletasks()
+    assert app._ad_search_var.get() == ""
+    assert app._ad_current_dn == users_ou
+    assert app._ad_search_results is None
+    assert [i for i in app.ad_list.get_children()] == [jdoe["dn"]]
+    assert app.ad_list.selection() == (jdoe["dn"],)
+    assert app.ad_tree.selection() == (users_ou,)
+
+
+def test_ad_search_result_click_on_container_moves_into_it(root, patched_clients):
+    """A search result that is itself a container moves into it
+    (v1.8.9), rather than to its parent."""
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    root_dn = "DC=example,DC=local"
+    users_ou = "OU=Users," + root_dn
+    jdoe = {"dn": "CN=jdoe," + users_ou, "name": "John Doe", "type": "user",
+            "description": "Analyst", "status": "Enabled", "locked": False}
+    users_row = {"dn": users_ou, "name": "Users", "type": "ou",
+                 "description": "", "status": "", "locked": False}
+
+    def list_children(dn):
+        if dn == root_dn:
+            return [users_row]
+        if dn == users_ou:
+            return [jdoe]
+        return []
+
+    def search_objects(base_dn, query):
+        return [users_row] if "users" in query.lower() else []
+
+    app.ad_client.list_children = list_children
+    app.ad_client.search_objects = search_objects
+    app.ad_tree.selection_set(root_dn)
+    app._ad_on_tree_select(None)
+    root.update_idletasks()
+    app._ad_search_var.set("users")
+    app._ad_apply_filter()
+    root.update_idletasks()
+    assert [i for i in app.ad_list.get_children()] == [users_ou]
+    app.ad_list.selection_set(users_ou)
+    app._ad_on_list_select(None)
+    root.update_idletasks()
+    assert app._ad_search_var.get() == ""
+    assert app._ad_current_dn == users_ou
+    assert [i for i in app.ad_list.get_children()] == [jdoe["dn"]]
+    assert app.ad_tree.selection() == (users_ou,)
+
+
+def test_connection_lost_during_search_returns_to_login(root, patched_clients, monkeypatch):
+    """A dead DC connection during a search (v1.8.9): instead of the
+    raw "LDAP search failed: socket sending error[Errno 32] Broken
+    pipe" dialog with the app left looking connected, the app says
+    plainly the connection was closed and returns to the login-ready
+    state (disconnected, Connect available, trees cleared)."""
+    from msat.ldap_client import ADConnectionLostError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+
+    def dead_search(base_dn, query):
+        raise ADConnectionLostError(
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped). Please reconnect.")
+    app.ad_client.search_objects = dead_search
+    app._ad_search_var.set("doe")
+    app._ad_apply_filter()
+    root.update_idletasks()
+    # Returned to the login-ready state.
+    assert app.ad_client is None
+    assert len(app.ad_list.get_children()) == 0
+    assert len(app.ad_tree.get_children()) == 0
+    # The message says the connection was closed (not "Broken pipe").
+    assert shown, "expected a connection-closed message"
+    text = " ".join(str(a) for a in shown[0])
+    assert "closed" in text.lower()
+    assert "Broken pipe" not in text
+    assert "timed out" in text.lower() or "dropped" in text.lower()
+    # The status bar says the same, and Connect is usable again.
+    assert "closed" in app.statusbar["text"].lower()
+    assert str(app.connect_btn["state"]) == "normal"
+
+
+def test_connection_lost_during_list_load_returns_to_login(root, patched_clients, monkeypatch):
+    """The same handling for a dead connection hit while loading a
+    container's children (the path the v1.8.8 "Broken pipe" dialog
+    came from)."""
+    from msat.ldap_client import ADConnectionLostError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+
+    def dead_list(dn):
+        raise ADConnectionLostError(
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped). Please reconnect.")
+    app.ad_client.list_children = dead_list
+    app._ad_refresh_list("DC=example,DC=local")
+    root.update_idletasks()
+    assert app.ad_client is None
+    assert shown, "expected a connection-closed message"
+    text = " ".join(str(a) for a in shown[0])
+    assert "Broken pipe" not in text
+    assert "closed" in text.lower()
 
 
 def test_ad_list_shows_locked_column(root, patched_clients):
@@ -557,6 +744,10 @@ def test_ad_search_clear_button_restores_full_list(root, patched_clients):
         {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
          "type": "user", "description": "Manager", "status": "Enabled"},
     ]
+    # The search is a server search now (v1.8.9): the fake returns
+    # the matching row for "john".
+    app.ad_client.search_objects = lambda base_dn, query: [
+        r for r in app._ad_rows if query.lower() in r["name"].lower()]
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 2
     app._ad_search_var.set("john")
@@ -1548,6 +1739,10 @@ def test_search_filter_is_debounced(root, patched_clients):
         {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
          "type": "user", "description": "Manager", "status": "Enabled"},
     ]
+    # The search is a server search now (v1.8.9): the fake returns
+    # the matching row for "john".
+    app.ad_client.search_objects = lambda base_dn, query: [
+        r for r in app._ad_rows if query.lower() in r["name"].lower()]
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 2
     entry = app._search_entries[0]  # AD search entry
@@ -1558,12 +1753,18 @@ def test_search_filter_is_debounced(root, patched_clients):
     # focus to the test window on its own.
     entry.focus_force()
     app._ad_search_var.set("john")
-    entry.event_generate("<KeyRelease>", keysym="n")
-    root.update()
-    # Not yet filtered — the debounce has not fired.
+    # Setting the search text does not filter on its own — the
+    # filter only runs via the debounced KeyRelease handler.
     assert len(app.ad_list.get_children()) == 2
+    entry.event_generate("<KeyRelease>", keysym="n")
+    # Process the keystroke (schedules the 150 ms debounce timer).
+    # Under load this call can itself take longer than the debounce,
+    # so the timer may already have fired — the unfiltered state is
+    # asserted above, before any event processing, instead of here.
+    root.update()
     time.sleep(0.25)
     root.update()
+    # Once the debounce has elapsed, the filter has run.
     assert len(app.ad_list.get_children()) == 1
 
 
@@ -1584,6 +1785,11 @@ def test_disconnect_cancels_pending_search_debounce(root, patched_clients,
     # captures the bound method at construction time, so the debounced
     # callback must already be the counting wrapper.
     monkeypatch.setattr(MSATApp, "_ad_apply_filter", _counting)
+    # Lengthen the debounce so the timer cannot fire while
+    # root.update() processes the keystroke (under load that call
+    # can itself take longer than the 150 ms debounce, which used
+    # to let the filter run before the disconnect under test).
+    monkeypatch.setattr("msat.app.SEARCH_DEBOUNCE_MS", 10000)
     app = MSATApp(root)
     _connect_app(app, "dc1")
     root.update_idletasks()
@@ -1602,7 +1808,7 @@ def test_disconnect_cancels_pending_search_debounce(root, patched_clients,
     root.update()
     # A timer is now pending (the debounce has not fired).
     assert app._search_debounce_pending[0].get("after_id") is not None
-    # Disconnect before the 150 ms debounce elapses.
+    # Disconnect before the debounce elapses.
     calls.clear()
     app._global_disconnect()
     root.update_idletasks()
@@ -1662,6 +1868,10 @@ def test_search_clear_button_still_filters_immediately(root, patched_clients):
         {"dn": "CN=asmith,DC=example,DC=local", "name": "Alice Smith",
          "type": "user", "description": "Manager", "status": "Enabled"},
     ]
+    # The search is a server search now (v1.8.9): the fake returns
+    # the matching row for "john".
+    app.ad_client.search_objects = lambda base_dn, query: [
+        r for r in app._ad_rows if query.lower() in r["name"].lower()]
     app._ad_search_var.set("john")
     app._ad_apply_filter()
     assert len(app.ad_list.get_children()) == 1
@@ -1708,6 +1918,37 @@ def test_edit_record_dialog_float_ttl_shows_integer(root):
         dlg._on_cancel()
 
 
+def test_add_record_dialog_name_starts_with_at_hint(root):
+    """Add DNS Record (v1.8.9): the name field starts with "@" (the
+    zone apex) instead of a label that was wider than the dialog
+    and got cut off. Leaving it creates an apex record; focusing
+    the field selects it, so typing a name replaces it."""
+    from msat.dialogs import AddRecordDialog
+    add = AddRecordDialog(root, "example.local")
+    try:
+        assert add.name.get() == "@"
+        # Focusing the field selects the hint, so typing replaces it.
+        # (focus_set() alone grants no window focus under xvfb, so
+        # the FocusIn event is generated directly — it is the same
+        # event a real click produces. That a real keypress then
+        # replaces the selection is standard Tk Entry behaviour.)
+        add.name.event_generate("<FocusIn>")
+        root.update()
+        assert add.name.selection_present()
+        assert add.name.index(tk.SEL_FIRST) == 0
+        assert add.name.index(tk.SEL_LAST) == 1
+        # And leaving "@" alone is a valid apex record.
+        add2 = AddRecordDialog(root, "example.local")
+        try:
+            add2.data.insert(0, "192.168.1.10")
+            assert add2.validate() is True
+            assert add2.collect()["name"] == "@"
+        finally:
+            add2._on_cancel()
+    finally:
+        add._on_cancel()
+
+
 def test_record_dialogs_reject_negative_ttl(root, monkeypatch):
     """A negative TTL is rejected by both record dialogs (v1.8.5)."""
     from msat.dialogs import AddRecordDialog, EditRecordDialog
@@ -1716,6 +1957,9 @@ def test_record_dialogs_reject_negative_ttl(root, monkeypatch):
                         lambda *a, **k: shown.append(a))
     add = AddRecordDialog(root, "example.local")
     try:
+        # The name field starts pre-filled with "@" (v1.8.9): clear
+        # it before typing, the way a user does by clicking in.
+        add.name.delete(0, tk.END)
         add.name.insert(0, "pc01")
         add.data.insert(0, "192.168.1.10")
         add.ttl.insert(0, "-5")
