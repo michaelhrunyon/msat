@@ -2334,6 +2334,19 @@ class MSATApp:
                             "{} trust(s).".format(len(sites), len(subnets),
                                                  len(trusts)))
             return True
+        # A dead LDAP connection ends the session wherever it is
+        # discovered — including here, where failures are otherwise
+        # only noted inline. Route it through _error, which returns
+        # the app to the login screen and clears every tab (the same
+        # blank canvas as clicking Disconnect), instead of leaving
+        # the directory data visible. Stop here: the app is now
+        # disconnected, so there is no "partly unavailable" state
+        # to report. Only on an explicit refresh, not during
+        # connect (where the connection was just validated and a
+        # tab failure is reported in the status bar).
+        if not quiet and isinstance(first_error, ADConnectionLostError):
+            self._error(first_error)
+            return first_error
         if not quiet and load_error is not None:
             self._error(load_error)
         self.set_status("Directory info partly unavailable: {}".format(first_error))

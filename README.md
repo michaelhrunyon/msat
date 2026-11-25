@@ -300,11 +300,9 @@ xvfb-run -a .venv/bin/python -m pytest tests/ -q
 
 ## Current status
 
-**v1.8.9** — tested against a live Active Directory environment (3 DCs). 247 tests passing.
+**v1.8.10** — tested against a live Active Directory environment (3 DCs). 249 tests passing.
 
-- **AD search is now recursive:** typing in the search box searches the whole subtree below the selected node (users, computers, groups, OUs), so searching from the domain root finds objects in any OU. Clicking a result moves the view to the OU holding it (a container result moves into itself).
-- **Add DNS Record:** the name field starts with `@` (the zone apex) instead of a label that was cut off by the dialog width; focusing the field selects it, so typing a name replaces it.
-- **Dropped DC connection:** a timed-out / dropped LDAP connection (the old raw "Broken pipe" error) now says plainly the connection was closed and returns the app to the login screen, instead of leaving it looking connected.
+- **Timeout disconnect now clears everything:** when the DC closes the connection (idle timeout / dropped), the app returns to the login screen and clears all shown data — AD, DHCP, DNS and Directory Info — and wipes the password, exactly like clicking Disconnect. Previously the Directory Info refresh noted a dead connection inline and left the data visible.
 
 ## Known limitations
 

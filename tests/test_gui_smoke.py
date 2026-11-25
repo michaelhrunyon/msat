@@ -704,6 +704,121 @@ def test_connection_lost_during_list_load_returns_to_login(root, patched_clients
     assert "closed" in text.lower()
 
 
+def test_connection_lost_clears_every_tab_like_disconnect(root, patched_clients, monkeypatch):
+    """A timeout disconnect must clear ALL shown data, exactly like
+    clicking Disconnect — not just the AD tab. The security point:
+    data left visible on an unattended, unlocked workstation could
+    be read by anyone walking up. So DHCP scopes/leases/
+    reservations, DNS zones/records and the Directory Info content
+    must all be blank afterwards, and the password wiped."""
+    from msat.ldap_client import ADConnectionLostError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+
+    # Simulate loaded data on every tab. (The AD tree already holds
+    # the domain root from connecting, so add a child OU, not the
+    # root itself.)
+    app.ad_tree.insert("DC=example,DC=local", "end",
+                       iid="OU=Users,DC=example,DC=local", text="Users")
+    app.ad_list.insert("", "end", values=("jdoe", "user", "", "Enabled", ""))
+    app.dhcp_scopes.insert("", "end", values=("192.168.1.0", "Scope1", "Active"))
+    app.dhcp_leases.insert("", "end", values=("192.168.1.10", "pc01", "Active"))
+    app.dhcp_reservations.insert("", "end", values=("192.168.1.20", "srv01", "AA:BB"))
+    app.dns_zones.insert("", "end", values=("example.local", "Primary", "Running"))
+    app.dns_records.insert("", "end", values=("www", "A", "192.168.1.5", "3600"))
+    app.info_text.config(state=tk.NORMAL)
+    app.info_text.insert("1.0", "Site: Default-First-Site-Name\n")
+    app.info_text.config(state=tk.DISABLED)
+    app.info_sites.insert("", "end", values=("Default-First-Site-Name", ""))
+    app.info_trusts.insert("", "end", values=("other.local", "External"))
+    root.update_idletasks()
+
+    def dead_search(base_dn, query):
+        raise ADConnectionLostError(
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped). Please reconnect.")
+    app.ad_client.search_objects = dead_search
+    app._ad_search_var.set("doe")
+    app._ad_apply_filter()
+    root.update_idletasks()
+
+    assert app.ad_client is None
+    assert len(app.ad_tree.get_children()) == 0
+    assert len(app.ad_list.get_children()) == 0
+    assert len(app.dhcp_scopes.get_children()) == 0
+    assert len(app.dhcp_leases.get_children()) == 0
+    assert len(app.dhcp_reservations.get_children()) == 0
+    assert len(app.dns_zones.get_children()) == 0
+    assert len(app.dns_records.get_children()) == 0
+    assert app.info_text.get("1.0", tk.END).strip() == ""
+    assert len(app.info_sites.get_children()) == 0
+    assert len(app.info_trusts.get_children()) == 0
+    assert app.password_var.get() == ""
+    assert str(app.connect_btn["state"]) == "normal"
+    assert str(app.disconnect_btn["state"]) == "disabled"
+
+
+def test_connection_lost_via_info_refresh_clears_every_tab(root, patched_clients, monkeypatch):
+    """The same blank canvas when the dead connection is discovered
+    by a Directory Info refresh (v1.8.10): _info_refresh used to
+    swallow LDAP failures inline (noting them in the info text) and
+    never disconnect, so the directory data stayed visible. A
+    connection-lost error there now routes through _error and
+    returns the app to the login screen, clearing every tab."""
+    from msat.ldap_client import ADConnectionLostError
+    shown = []
+    monkeypatch.setattr("msat.app.messagebox.showwarning",
+                        lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("msat.app.messagebox.showerror",
+                        lambda *a, **k: shown.append(a))
+    app = MSATApp(root)
+    _connect_app(app, "dc1")
+    root.update_idletasks()
+    assert app.ad_client is not None
+
+    # Simulate loaded data on every tab.
+    app.ad_tree.insert("DC=example,DC=local", "end",
+                       iid="OU=Users,DC=example,DC=local", text="Users")
+    app.ad_list.insert("", "end", values=("jdoe", "user", "", "Enabled", ""))
+    app.dhcp_scopes.insert("", "end", values=("192.168.1.0", "Scope1", "Active"))
+    app.dns_zones.insert("", "end", values=("example.local", "Primary", "Running"))
+    app.info_text.config(state=tk.NORMAL)
+    app.info_text.insert("1.0", "Site: Default-First-Site-Name\n")
+    app.info_text.config(state=tk.DISABLED)
+    root.update_idletasks()
+
+    def dead(*a, **k):
+        raise ADConnectionLostError(
+            "The connection to the domain controller was closed "
+            "(it timed out or was dropped). Please reconnect.")
+    # RootDSE fails and the loaders fail too (same dead connection).
+    app.ad_client.get_root_dse = dead
+    app.ad_client.list_sites = dead
+    app.ad_client.list_subnets = dead
+    app.ad_client.list_trusted_domains = dead
+    app._info_refresh(quiet=False)
+    root.update_idletasks()
+
+    assert app.ad_client is None
+    assert len(app.ad_tree.get_children()) == 0
+    assert len(app.ad_list.get_children()) == 0
+    assert len(app.dhcp_scopes.get_children()) == 0
+    assert len(app.dns_zones.get_children()) == 0
+    assert app.info_text.get("1.0", tk.END).strip() == ""
+    assert shown, "expected a connection-closed message"
+    text = " ".join(str(a) for a in shown[0])
+    assert "Broken pipe" not in text
+    assert "closed" in text.lower()
+    assert str(app.connect_btn["state"]) == "normal"
+
+
 def test_ad_list_shows_locked_column(root, patched_clients):
     """Locked-out users are identifiable at a glance in their own
     'Locked' column ('Yes'); other rows are blank there."""

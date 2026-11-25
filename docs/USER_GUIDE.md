@@ -38,7 +38,11 @@ both return to gray.
 inactivity, v1.8.9): the next operation says plainly that the
 connection was closed and returns the app to the login screen —
 just click **Connect** again. The app no longer shows the raw
-"Broken pipe" error and leaves itself looking connected.
+"Broken pipe" error and leaves itself looking connected. A
+timeout disconnect clears all shown data — AD, DHCP, DNS and
+Directory Info — and wipes the password, exactly like clicking
+**Disconnect** (v1.8.10), so no directory data is left visible on
+an unattended workstation.
 
 **Role detection.** Once the credentials check out, the app
 examines the installed roles on the connected server (over WinRM)
